@@ -648,7 +648,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   add_executable(prefill_gemm_parity tests/prefill_gemm_parity.cpp)
   target_include_directories(prefill_gemm_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill CUDA::cudart)
+  # the selected runtime: CUDA::cudart on CUDA, strata_hip_runtime on HIP (a HIP configure has no CUDA::cudart target)
+  target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
   add_test(NAME prefill_gemm_parity COMMAND prefill_gemm_parity)
 
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
