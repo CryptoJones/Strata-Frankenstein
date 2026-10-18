@@ -666,6 +666,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
+    # Frankenstein: the HIP helper worker - the CUDA engine on another machine (or this one, built for CUDA) loads it
+    # with --helper-worker.  Hidden visibility: only strata_helper_api_v1 is exported; the engine never sees a second
+    # copy of the kernels or the HIP runtime.  Built from a HIP configure (-DSTRATA_ENABLE_HIP=ON) of this same tree.
+    add_library(strata_helper_hip SHARED src/helpers/hip_helper.cu)
+    target_include_directories(strata_helper_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_helper_hip PRIVATE strata_kernels strata_hip_runtime)
+    set_target_properties(strata_helper_hip PROPERTIES CXX_VISIBILITY_PRESET hidden HIP_VISIBILITY_PRESET hidden
+                          VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON OUTPUT_NAME "strata_helper_hip")
+    target_link_options(strata_helper_hip PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic)
     enable_testing()
     set(_strata_hip_tests)
     add_executable(hip_prefill_gemm tests/hip/prefill_gemm.cpp)
