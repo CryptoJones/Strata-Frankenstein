@@ -41,11 +41,14 @@ struct strata_helper_device {
     // per-launch state
     std::vector<float> rows;          // n_entries * n_embd, the packed result
     std::vector<float> x;             // the activation rows, copied at begin
-    // native scratch
+    // native scratch, one row per token of the window: an expert is applied to ALL its tokens in one call, as the
+    // pool's ExpertJobMulti does - some gate/up types take a multi-token kernel from native_gu_mt_min tokens on,
+    // which is not bit-equal to the per-token kernel (#152), so one entry at a time would not match the pool
     NativeFmt fmt{};
     int fmt_gu = -1, fmt_d = -1;
-    std::vector<uint8_t> act, hq;
-    std::vector<float> ff;
+    std::vector<uint8_t> act, hq;        // max_tokens * kNativeActBytes / kNativeHBytes
+    std::vector<float> ff;               // max_tokens * n_ff
+    std::vector<uint8_t> act_done;       // per token of this launch: activation already quantized
     // S2 scratch
     ActQ act_q{};
     ExpertScratch ws{};
@@ -86,9 +89,10 @@ int w_open(int device, const strata_helper_open_params* p, strata_helper_device*
     }
     dev->rows.assign((size_t) (p->max_entries * p->n_embd), 0.0f);
     dev->x.assign((size_t) (p->max_tokens * p->n_embd), 0.0f);
-    dev->act.assign(kNativeActBytes, 0);
-    dev->hq.assign(kNativeHBytes, 0);
-    dev->ff.assign((size_t) p->n_ff, 0.0f);
+    dev->act.assign((size_t) p->max_tokens * kNativeActBytes, 0);
+    dev->hq.assign((size_t) p->max_tokens * kNativeHBytes, 0);
+    dev->ff.assign((size_t) p->max_tokens * (size_t) p->n_ff, 0.0f);
+    dev->act_done.assign((size_t) p->max_tokens, 0);
     *out = dev.release();
     return 0;
 }
@@ -119,18 +123,28 @@ int w_read_slot(strata_helper_device* dev, int32_t slot, uint8_t* dst, int64_t b
     return 0;
 }
 
-// One entry, native pack: the pool's row functions over every row, exactly as run_split_multi_native composes
-// them for one token - gate/up rows, the intermediate's quantization, down rows.
-bool native_entry(strata_helper_device& d, const uint8_t* blob, const float* x_row, float* out_row, std::string& err) {
-    native_quant_act(d.fmt, x_row, d.act.data());
-    const void* act = d.act.data();
-    float* ffp = d.ff.data();
-    native_gu_rows(d.fmt, blob, &act, 1, &ffp, 0, (int) d.n_ff);
-    native_quant_h(d.fmt, d.ff.data(), d.hq.data());
-    const void* hq = d.hq.data();
-    native_down_rows(d.fmt, blob, &hq, 1, &out_row, 0, (int) d.n_embd);
-    (void) err;
-    return true;
+// One expert for the `nt` tokens routed to it, native pack: the pool's row functions over every row, composed as
+// run_split_multi_native composes them for one ExpertJobMulti - gate/up rows for all the tokens, each token's
+// intermediate quantized, down rows for all the tokens.  Bitwise the pool's result for the same (expert, tokens).
+void native_group(strata_helper_device& d, const uint8_t* blob, const int32_t* toks, int nt, float* const* out_rows) {
+    const void* acts[MAXT]; float* ffs[MAXT]; const void* hqs[MAXT];
+    for (int t = 0; t < nt; ++t) {
+        const int32_t tok = toks[t];
+        uint8_t* a = d.act.data() + (size_t) tok * kNativeActBytes;
+        if (!d.act_done[(size_t) tok]) {
+            native_quant_act(d.fmt, d.x.data() + (size_t) tok * d.n_embd, a);
+            d.act_done[(size_t) tok] = 1;
+        }
+        acts[t] = a;
+        ffs[t] = d.ff.data() + (size_t) t * d.n_ff;
+    }
+    native_gu_rows(d.fmt, blob, acts, nt, ffs, 0, (int) d.n_ff);
+    for (int t = 0; t < nt; ++t) {
+        uint8_t* h = d.hq.data() + (size_t) t * kNativeHBytes;
+        native_quant_h(d.fmt, ffs[t], h);
+        hqs[t] = h;
+    }
+    native_down_rows(d.fmt, blob, hqs, nt, out_rows, 0, (int) d.n_embd);
 }
 
 int w_begin(strata_helper_device* dev, const strata_helper_launch* L, char* err, size_t cap) {
@@ -149,21 +163,23 @@ int w_begin(strata_helper_device* dev, const strata_helper_launch* L, char* err,
         // the S2 pack: one quantized activation per token would be shared across experts in the pool; here each
         // entry quantizes its own, which is the same bytes (the quantizer is a pure function of the row)
     }
-    std::string e;
+    std::fill(dev->act_done.begin(), dev->act_done.end(), 0);
     for (int32_t g = 0; g < L->n_groups; ++g) {
         const int32_t slot = L->slot[g];
         if (slot < 0 || (size_t) slot >= dev->slots.size()) return fail(err, cap, "cpu-reference: a launch names a slot that does not exist");
         const uint8_t* blob = dev->slots[(size_t) slot].bytes.get();
-        for (int32_t i = L->start[g]; i < L->start[g + 1]; ++i) {
-            const int32_t t = L->tok[i];
-            if (t < 0 || t >= L->n_tok) return fail(err, cap, "cpu-reference: a launch entry names a token outside the window");
-            const float* x_row = dev->x.data() + (size_t) t * dev->n_embd;
-            float* out_row = dev->rows.data() + (size_t) i * dev->n_embd;
-            if (dev->native) {
-                if (!native_entry(*dev, blob, x_row, out_row, e)) return fail(err, cap, e);
-            } else {
-                act_quant_q8_1(x_row, (int) dev->n_embd, dev->act_q);
-                s2_expert_vnni_q(blob, dev->act_q, out_row, dev->ws);
+        const int32_t first = L->start[g], last = L->start[g + 1];
+        if (last - first > MAXT || last < first) return fail(err, cap, "cpu-reference: a group with more tokens than a window holds");
+        for (int32_t i = first; i < last; ++i)
+            if (L->tok[i] < 0 || L->tok[i] >= L->n_tok) return fail(err, cap, "cpu-reference: a launch entry names a token outside the window");
+        if (dev->native) {
+            float* outs[MAXT];
+            for (int32_t i = first; i < last; ++i) outs[i - first] = dev->rows.data() + (size_t) i * dev->n_embd;
+            native_group(*dev, blob, L->tok + first, (int) (last - first), outs);
+        } else {
+            for (int32_t i = first; i < last; ++i) {
+                act_quant_q8_1(dev->x.data() + (size_t) L->tok[i] * dev->n_embd, (int) dev->n_embd, dev->act_q);
+                s2_expert_vnni_q(blob, dev->act_q, dev->rows.data() + (size_t) i * dev->n_embd, dev->ws);
             }
         }
     }
