@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_helper.hpp"
 #include "strata/core/expert_source.hpp"
 
 #include <cuda_runtime.h>
@@ -17,10 +18,10 @@ class RemoteExpertOpt;
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
-class RemoteExperts {
+class RemoteExperts final : public IExpertHelper {
 public:
     RemoteExperts() = default;
-    ~RemoteExperts();
+    ~RemoteExperts() override;
     RemoteExperts(const RemoteExperts&) = delete;
     RemoteExperts& operator=(const RemoteExperts&) = delete;
 
@@ -35,23 +36,24 @@ public:
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
     /// or null on the one-token path. Entries already served on CUDA0 are excluded.
+    std::string label() const override { return "CUDA" + std::to_string(device_); }
     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                int64_t k, const int32_t* kind, const int32_t* primary_res,
-               std::string& err);
-    bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+               std::string& err) override;
+    bool owns(int64_t index) const override { return owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
-    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    bool holds(int64_t layer, int32_t expert) const override { return cache_.slot_of(layer, expert) >= 0; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
-    bool finish(float* out, std::string& err);
-    int64_t resident() const { return cache_.resident(); }
-    int64_t computed() const { return computed_; }
-    int64_t launched_layers() const { return launched_layers_; }
-    double gib() const { return cache_.gib(); }
-    uint64_t returned_bytes() const { return returned_bytes_; }
-    uint64_t full_row_bytes() const { return full_row_bytes_; }
+    bool finish(float* out, std::string& err) override;
+    int64_t resident() const override { return cache_.resident(); }
+    int64_t computed() const override { return computed_; }
+    int64_t launched_layers() const override { return launched_layers_; }
+    double gib() const override { return cache_.gib(); }
+    uint64_t returned_bytes() const override { return returned_bytes_; }
+    uint64_t full_row_bytes() const override { return full_row_bytes_; }
     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
-    double ms_begin() const { return ms_begin_; }
-    double ms_wait() const { return ms_wait_; }
+    double ms_begin() const override { return ms_begin_; }
+    double ms_wait() const override { return ms_wait_; }
 
     /// STRATA_PREFILL_HELPER_SOURCE (opt-in): copy up to `n` cached blobs into the host buffers `dst[i]`
     /// on this helper's own stream and wait.  `hit[i]` is set where this helper held (layer, expert); the
@@ -60,7 +62,7 @@ public:
     /// complete (the stream is drained), so the caller falls back for the rest.  Safe from several threads
     /// (one stream, one lock): the prompt path's stager is threaded.
     bool copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
-                           uint8_t* hit, std::string& err);
+                           uint8_t* hit, std::string& err) override;
 
 private:
     friend class RemoteExpertOpt;
@@ -112,12 +114,12 @@ private:
 /// without ordering the copies against their kernel streams.
 class RemotePrefillSource final : public ExpertSource {
 public:
-    RemotePrefillSource(ExpertSource& fallback, const std::vector<RemoteExperts*>& helpers)
+    RemotePrefillSource(ExpertSource& fallback, const std::vector<IExpertHelper*>& helpers)
         : fallback_(fallback), helpers_(helpers) {}
 
     /// Whether any helper's VRAM cache holds (layer, expert) right now.
     bool from_helper(int64_t layer, int64_t expert) const {
-        for (const RemoteExperts* h : helpers_) if (h->holds(layer, (int32_t) expert)) return true;
+        for (const IExpertHelper* h : helpers_) if (h->holds(layer, (int32_t) expert)) return true;
         return false;
     }
     /// Blobs / bytes this source has taken from the helpers so far (the per-request evidence line).
@@ -165,7 +167,7 @@ public:
 private:
     void warn(const std::string& err);
     ExpertSource& fallback_;
-    std::vector<RemoteExperts*> helpers_;
+    std::vector<IExpertHelper*> helpers_;
     std::atomic<uint64_t> helper_blobs_{0}, helper_bytes_{0};
     std::atomic<bool> warned_{false};
 };

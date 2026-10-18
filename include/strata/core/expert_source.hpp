@@ -47,6 +47,7 @@ namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
+class IExpertHelper;   // Frankenstein: one helper expert tier (expert_helper.hpp): CUDA1..3, or a worker library's device
 struct LoadStats;
 
 namespace detail {
@@ -336,7 +337,8 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
+    static constexpr int kMaxHelpers = 4;
+    IExpertHelper* remote[kMaxHelpers] = {}; ///< optional helper tiers (CUDA1..3, a foreign worker) for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
 

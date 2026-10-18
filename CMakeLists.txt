@@ -484,13 +484,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+    src/core/foreign_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp
     src/core/conversation_disk.cpp src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
     src/core/peer_experts.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+    ${CMAKE_DL_LIBS})   # Frankenstein: dlopen of a helper worker library (foreign_experts.cpp)
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
     target_include_directories(exchange_storage_test PRIVATE include)
@@ -1235,6 +1237,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
 endif()
 
+# Frankenstein: the CPU reference helper worker is a SHARED library that links the CPU kernels (and ggml-cpu behind
+# them), so those static libraries are built position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
@@ -1753,4 +1758,28 @@ if(STRATA_HIP_GFX906)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
+endif()
+
+# ---------------------------------------------------------------- Frankenstein: helper worker libraries
+# A helper worker (include/strata/helper/strata_helper_abi.h) is a shared library the engine loads with
+# --helper-worker: one more expert tier on a device the engine's own runtime cannot drive.  The CPU reference
+# worker computes its experts with the CPU kernels, so with it enabled every token must be bit-identical to a run
+# without it - the test of the engine side (loader, slot table, grouping, row return) on a machine with no second
+# GPU at all.  It links only the CPU kernels: no device runtime of the engine's reaches it.
+add_library(strata_helper_cpu_reference SHARED src/helpers/cpu_reference_helper.cpp)
+target_include_directories(strata_helper_cpu_reference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_helper_cpu_reference PRIVATE strata_kernels_cpu)
+set_target_properties(strata_helper_cpu_reference PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON
+                      POSITION_INDEPENDENT_CODE ON PREFIX "lib" OUTPUT_NAME "strata_helper_cpu_reference")
+# the ABI's own test: loads the worker through the engine's loader, opens slots, fills, verifies, reads back
+if(TARGET strata_engine)
+  add_executable(helper_abi_test tests/core/helper_abi_test.cpp)
+  target_link_libraries(helper_abi_test PRIVATE strata_engine)
+  target_compile_definitions(helper_abi_test PRIVATE
+    STRATA_HELPER_CPU_REFERENCE_PATH="$<TARGET_FILE:strata_helper_cpu_reference>")
+  add_dependencies(helper_abi_test strata_helper_cpu_reference)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME helper_abi_test COMMAND helper_abi_test)
+    set_tests_properties(helper_abi_test PROPERTIES TIMEOUT 120)
+  endif()
 endif()
