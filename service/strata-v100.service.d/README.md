@@ -9,7 +9,7 @@ conversation cache in the private configuration and `.strata-service.env`.
 | --- | --- |
 | `90-cpu-prefill.conf` | the CPU-assisted prompt staging (`STRATA_PREFILL_CPU_SHARE=auto`) |
 | `95-v0141-profile.conf` | the v0.1.41 profile: the CPU prefill share, the staged-chunk limit, the embedding-buffer accounting and the Volta master switch (`STRATA_SM70_TABLE=1`) |
-| `96-prefill-performance.conf` | FP16 tensor-core experts, skipped unrouted experts, elastic KV growth, pooled checkpoint buffers, parallel stage checkpoint saves, exact wide dequantization, and up to 2048 expert-cache admissions per stage and input loan |
+| `96-prefill-performance.conf` | FP16 tensor-core experts, skipped unrouted experts, elastic KV growth, pooled checkpoint buffers, parallel stage checkpoint saves, exact wide dequantization, up to 2048 expert-cache admissions per stage and input loan, batched split-draft K/V, and tiled FP32 QSA selection |
 | `97-resident-routing.conf` | the residency-biased routing (`STRATA_ROUTE_RESIDENT=1`); it can change the model's answers |
 
 Install them with:
@@ -49,3 +49,13 @@ The cache size, KV capacity, KV format, and model quantization stay unchanged.
 
 See the [cache admission report](../../benchmarks/v100-prefill-cache-admission-2026-10-21.md)
 for the four-arm comparison and full-request limits.
+
+The 2026-10-25 profile also selects `STRATA_SPLIT_MTP_BATCH=1` and
+`STRATA_SELECT_SIMT=1`. Both remain opt-in in the engine. On the two
+V100 cards, tiled selection improved cold prompt throughput by about
+5.3% at 64K and 12.2% at 128K, with batched MTP already enabled.
+It was effectively neutral at 8K. The scorer uses a different FP32
+summation order; near-tied scores can select different attention cells.
+This is not an output-equivalence or decode-speed claim.
+See [the measured V100 results](../../docs/NVIDIA_V100.md#tiled-prompt-selection).
+The lean-buffer option stays off because of its short-prompt tradeoff.

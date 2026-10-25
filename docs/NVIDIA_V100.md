@@ -615,6 +615,65 @@ with `--targets 2048,8192,32768 --repeats 2 --max-new 256
 `--exe` in both arms. Set `--env STRATA_PF_WMMA_LEAN=0` or `=1`
 and use a separate `--out` and `--arm-label` for each restart.
 
+## Tiled prompt selection
+
+The daily two-V100 profile selects `STRATA_SELECT_SIMT=1`.
+On pre-sm_80 CUDA cards this uses a tiled FP32 scorer for prompt
+attention selection instead of the older warp scorer. The engine
+default stays unchanged; `STRATA_SELECT_SIMT=0` keeps the warp scorer.
+No model weights, KV format, cache capacity, or chunk size change.
+
+Measured on 2026-10-25 on the same two-V100 system described above:
+IQ3_S, 175 W, INT8 KV, 524288-token capacity, split 16, spec 4,
+pipeline windows 2, and 8192-token chunks. Batched MTP was enabled
+in every arm; lean buffers were disabled. Each restart read two
+uncached prompts per size and generated up to 256 tokens.
+The three arms used the same binary and matching prompt hashes:
+
+| Prompt tokens | Scorer off | Tiled scorer | Off again | Throughput gain vs first off |
+| ---: | ---: | ---: | ---: | ---: |
+| 65536 | 27.609 s | 26.212 s | 27.767 s | 5.3% |
+| 131072 | 58.216 s | 51.909 s | 58.235 s | 12.2% |
+
+The longer prompt saved about 6.3 seconds. This is an additional
+gain over batched MTP, not a comparison against a slower MTP baseline.
+A separate short-prompt run was effectively neutral at 8K and about
+2.7% faster at 32K. Do not expect the long-context gain at every size.
+
+The scorer changes FP32 summation order. In the synthetic comparison
+against FP64, the maximum score error was 4.36e-5 at 32K and 5.02e-5
+at 128K. All 256 query selections matched at 32K; 255 of 256 matched
+at 128K (0.0002% of selected cells differed). These checks do not
+establish model-quality equivalence. Decode continuations and draft
+acceptance varied; no fixed-work decode speedup is claimed.
+The alternate tiled scorer (`STRATA_SELECT_SIMT=2`) had the same
+score hash at 32K but did not improve its microbenchmark time.
+
+The [measurement rows](../benchmarks/v100-qsa-simt-2026-10-25.json)
+record the binary and prompt hashes, decode counts, numerical checks,
+and rejected alternatives. A 16384-token chunk was slower at 32K
+(14.87 s versus about 14.06 s with lean buffers and 8192-token chunks).
+`STRATA_GDN_CHUNK=1` also lost (17.27 s versus about 14.36 s at 32K).
+Neither is enabled.
+
+The long-run driver imported `bench/run_v100_prefill.py` and extended
+`ALLOWED_TARGETS` with `(65536, 131072)`. Prompt generation, the cold
+request protocol, and cooldown settings were unchanged. The normal
+harness CLI still permits only its original sizes. For reproduction,
+run it through this Python entry point, then append the normal
+`--config`, `--exe`, `--arm-label`, and `--out` arguments:
+
+```sh
+python -c 'from bench import run_v100_prefill as h; h.ALLOWED_TARGETS += (65536, 131072); raise SystemExit(h.main())' \
+  --targets 65536,131072 --repeats 2 --max-new 256 --no-settings-strict \
+  --env STRATA_SPLIT_MTP_BATCH=1 --env STRATA_PF_WMMA_LEAN=0 \
+  --env STRATA_SELECT_SIMT=1
+```
+
+Use `STRATA_SELECT_SIMT=0` for the matched control and separate output
+directories for every restart. Preserve the service environment in the
+private harness config.
+
 ## Decode mixer overlap
 
 Set `STRATA_SIDE_MIXER=2` to test input-only mixer work on graph branches.
