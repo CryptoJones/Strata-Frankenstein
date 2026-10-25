@@ -597,13 +597,16 @@ include binary and prompt hashes, decode lengths, and acceptance counts.
 The harness kept the daily spec-4 and 750-MiB reserve rather than its
 strict spec-8/700-MiB profile. Prompt reuse was disabled.
 A threaded short-chunk copy issuer was also built and measured; it
-gave no gain and was removed. CUDA sm_70 built and ran; HIP was not
-built because its compiler was unavailable. SYCL's separate source
-was not changed.
-`prefill_plan_test`, `draft_kv_plan_test`, `pf_wmma_parity`, and
-`pf_wmma2_parity` passed. The aggregate CTest command reached its
-600-second deadline during `pf_wmma2_n64_parity`; that case did not
-finish, so it is not counted as passed.
+gave no gain and was removed. CUDA sm_70 built and ran. The full HIP
+engine also built for gfx1100 with ROCm 7.2.4. HIP execution was not
+tested: this machine has no AMD GPU or loaded AMD kernel driver.
+The earlier report that the HIP compiler was unavailable was incorrect.
+SYCL's separate source was not changed.
+
+`prefill_plan_test`, `draft_kv_plan_test`, `pf_wmma_parity`,
+`pf_wmma2_parity`, and `pf_wmma2_n64_parity` passed. The N64 case
+completed in 166.59 seconds when run separately after the aggregate
+CTest command had reached its 600-second deadline.
 
 To repeat the allocation experiment, export the service's environment
 into a private harness config, then run `bench/run_v100_prefill.py`
