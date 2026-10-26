@@ -539,6 +539,212 @@ expert weights, model quantization, KV format, or KV capacity.
 See the [cache admission and dequantization report](../benchmarks/v100-prefill-cache-admission-2026-10-21.md)
 for the measured read counts, four-arm TTFT results, and full-request costs.
 
+## Smaller prompt buffers and batched draft K/V
+
+`STRATA_PF_WMMA_LEAN=1` removes unused gathered FP16 input rows,
+FP16 expert intermediates, and the fallback dequantization ring on the
+direct Volta WMMA path. The expert products already read the original
+input through row indices. The option also skips the unused gather.
+It leaves the executed expert kernels and their arithmetic unchanged.
+
+This is opt-in. It requires `STRATA_PF_WMMA=1`, compute capability 7.0,
+and a native pack whose every layer has a supported direct WMMA format.
+Other devices and packs keep the existing allocation. The input and
+intermediate buffers needed by other expert paths remain unchanged.
+
+Measured on 2026-10-25: two Tesla V100-PCIE-16GB at 175 W, PCIe Gen3
+x4/x16, Ryzen 5 3600, IQ3_S, INT8 KV, 524288-token capacity, split 16,
+spec 4, pipeline windows 2, and 8192-token prompt chunks. With lean
+buffers, each stage's prompt loan fell from 3.24 to 2.73 GiB.
+CUDA0 borrowed 1561 rather than 1845 cache slots; CUDA1 borrowed
+1381 rather than 1640. The cache capacity itself did not change.
+
+Two cold prompts per size, in off/on/off restart order, gave these
+median prompt times. Both arms used batched draft K/V:
+
+| Prompt tokens | Lean off | Lean on | Lean off again |
+| ---: | ---: | ---: | ---: |
+| 2048 | 1933.0 ms | 1914.0 ms | 1934.9 ms |
+| 8192 | 5258.6 ms | 5082.9 ms | 5270.1 ms |
+| 32768 | 14340.9 ms | 14066.4 ms | 14363.8 ms |
+
+The prompt throughput gain was about 3.5% at 8K and 2.0% at 32K.
+The 2K difference was small. This is not a decode-speed claim:
+256-token decode medians at 8K were 107.5/97.4/103.4 tok/s.
+Answers and draft acceptance varied, including between control restarts.
+There is no bitwise-output or quality-equivalence claim. Smaller loans
+change expert placement, and the service uses residency-biased routing.
+
+A second lean-on restart with a 512-token output cap reproduced the
+prompt times (5086.1 ms at 8K, 14058.8 ms at 32K). Its matched
+lean-off control read those prompts in 5279.2 and 14363.2 ms.
+Decode at 8K was 121.7 tok/s on versus 119.7 off, but the two
+2K samples were slower with lean buffers (80.0/118.6 versus
+101.5/122.8 tok/s). One 32K control ended at EOS after 440 tokens.
+Keep this option off for the daily service until its short-prompt
+decode tradeoff is acceptable for the workload. It is a measured
+long-prefill option, not a general speed default.
+
+The existing `STRATA_SPLIT_MTP_BATCH=1` option separately improved
+prompt time on the installed engine. Its off/on/off medians were
+5524.5/5265.4/5538.0 ms at 8K and
+15383.4/14348.5/15423.7 ms at 32K. It changes draft K/V arithmetic
+and requires a restart. See [the split-draft requirements](MULTI_GPU.md).
+Do not interpret either prefill improvement as an equal decode gain.
+
+The [measurement rows](../benchmarks/v100-prefill-2026-10-25.json)
+include binary and prompt hashes, decode lengths, and acceptance counts.
+The harness kept the daily spec-4 and 750-MiB reserve rather than its
+strict spec-8/700-MiB profile. Prompt reuse was disabled.
+A threaded short-chunk copy issuer was also built and measured; it
+gave no gain and was removed. CUDA sm_70 built and ran. The full HIP
+engine also built for gfx1100 with ROCm 7.2.4. HIP execution was not
+tested: this machine has no AMD GPU or loaded AMD kernel driver.
+The earlier report that the HIP compiler was unavailable was incorrect.
+SYCL's separate source was not changed.
+
+`prefill_plan_test`, `draft_kv_plan_test`, `pf_wmma_parity`,
+`pf_wmma2_parity`, and `pf_wmma2_n64_parity` passed. The N64 case
+completed in 166.59 seconds when run separately after the aggregate
+CTest command had reached its 600-second deadline.
+
+To repeat the allocation experiment, export the service's environment
+into a private harness config, then run `bench/run_v100_prefill.py`
+with `--targets 2048,8192,32768 --repeats 2 --max-new 256
+--no-settings-strict --env STRATA_SPLIT_MTP_BATCH=1` and the same
+`--exe` in both arms. Set `--env STRATA_PF_WMMA_LEAN=0` or `=1`
+and use a separate `--out` and `--arm-label` for each restart.
+
+## Tiled prompt selection
+
+The daily two-V100 profile selects `STRATA_SELECT_SIMT=1`.
+On pre-sm_80 CUDA cards this uses a tiled FP32 scorer for prompt
+attention selection instead of the older warp scorer. The engine
+default stays unchanged; `STRATA_SELECT_SIMT=0` keeps the warp scorer.
+No model weights, KV format, cache capacity, or chunk size change.
+
+Measured on 2026-10-25 on the same two-V100 system described above:
+IQ3_S, 175 W, INT8 KV, 524288-token capacity, split 16, spec 4,
+pipeline windows 2, and 8192-token chunks. Batched MTP was enabled
+in every arm; lean buffers were disabled. Each restart read two
+uncached prompts per size and generated up to 256 tokens.
+The three arms used the same binary and matching prompt hashes:
+
+| Prompt tokens | Scorer off | Tiled scorer | Off again | Throughput gain vs first off |
+| ---: | ---: | ---: | ---: | ---: |
+| 65536 | 27.609 s | 26.212 s | 27.767 s | 5.3% |
+| 131072 | 58.216 s | 51.909 s | 58.235 s | 12.2% |
+
+The longer prompt saved about 6.3 seconds. This is an additional
+gain over batched MTP, not a comparison against a slower MTP baseline.
+A separate short-prompt run was effectively neutral at 8K and about
+2.7% faster at 32K. Do not expect the long-context gain at every size.
+
+The scorer changes FP32 summation order. In the synthetic comparison
+against FP64, the maximum score error was 4.36e-5 at 32K and 5.02e-5
+at 128K. All 256 query selections matched at 32K; 255 of 256 matched
+at 128K (0.0002% of selected cells differed). These checks do not
+establish model-quality equivalence. Decode continuations and draft
+acceptance varied; no fixed-work decode speedup is claimed.
+The alternate tiled scorer (`STRATA_SELECT_SIMT=2`) had the same
+score hash at 32K but did not improve its microbenchmark time.
+
+The [measurement rows](../benchmarks/v100-qsa-simt-2026-10-25.json)
+record the binary and prompt hashes, decode counts, numerical checks,
+and rejected alternatives. A 16384-token chunk was slower at 32K
+(14.87 s versus about 14.06 s with lean buffers and 8192-token chunks).
+`STRATA_GDN_CHUNK=1` also lost (17.27 s versus about 14.36 s at 32K).
+Neither is enabled.
+
+The long-run driver imported `bench/run_v100_prefill.py` and extended
+`ALLOWED_TARGETS` with `(65536, 131072)`. Prompt generation, the cold
+request protocol, and cooldown settings were unchanged. The normal
+harness CLI still permits only its original sizes. For reproduction,
+run it through this Python entry point, then append the normal
+`--config`, `--exe`, `--arm-label`, and `--out` arguments:
+
+```sh
+python -c 'from bench import run_v100_prefill as h; h.ALLOWED_TARGETS += (65536, 131072); raise SystemExit(h.main())' \
+  --targets 65536,131072 --repeats 2 --max-new 256 --no-settings-strict \
+  --env STRATA_SPLIT_MTP_BATCH=1 --env STRATA_PF_WMMA_LEAN=0 \
+  --env STRATA_SELECT_SIMT=1
+```
+
+Use `STRATA_SELECT_SIMT=0` for the matched control and separate output
+directories for every restart. Preserve the service environment in the
+private harness config.
+
+## Small-prompt prefill
+
+The measured two-V100 profile keeps automatic CPU-assisted prefill
+below 6144 read rows. It sets `STRATA_PREFILL_STREAM_MIN=6144` and
+`STRATA_PREFILL_CPU_SHARE_MAX=6144`; the previous profile used 3072.
+This keeps the hybrid path where it helps without extending it through
+8K, where it lost to the streamed path.
+
+The engine's new opt-in `STRATA_PREFILL_LOAN_EXACT=1` sizes a fresh
+single-chunk loan for its actual read length. Previously, rounding to
+256 rows could cross the staged/streamed cutoff and price a larger ring
+than the read used. The extra loan evicted useful experts. Exact loans
+keep those slots available. Planned continuations and fixed
+`--prefill-head-alias` layouts retain their original capacity.
+Unset or `0` preserves the old layout.
+
+Install the matching engine before using the new service profile.
+Without exact loans, the higher cutoff can still over-borrow near its
+boundary. The engine can hold back a token for the first output, so the
+read segment may be shorter than the total prompt length.
+
+Measured on 2026-10-25: two V100-PCIE-16GB at 175 W, PCIe Gen3 x4/x16,
+Ryzen 5 3600, IQ3_S, INT8 KV, 524288-token capacity, split 16, spec 4,
+pipeline windows 2. Batched MTP and tiled selection were enabled in
+every arm; lean buffers were off. All arms used the same binary and
+matching prompt hashes. Three cold prompts per size were run in the
+order old profile, new profile, old profile again (90 requests).
+
+The baseline below pools the six control samples per size. The new
+column is the median of its three samples. These are prefill times,
+not client time to first output or decode throughput.
+
+| Prompt tokens | Previous profile | New profile | Observed throughput change |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1.182 s | 1.198 s | -1.3% |
+| 2048 | 1.701 s | 1.702 s | -0.1% |
+| 3072 | 2.639 s | 2.265 s | +16.5% |
+| 4096 | 3.558 s | 2.876 s | +23.7% |
+| 5120 | 3.908 s | 3.607 s | +8.3% |
+| 6144 | 4.295 s | 4.231 s | +1.5% |
+| 7168 | 4.750 s | 4.753 s | -0.1% |
+| 8192 | 5.163 s | 5.156 s | +0.1% |
+| 9216 | 6.208 s | 6.243 s | -0.6% |
+| 10240 | 6.643 s | 6.634 s | +0.1% |
+
+The clear gains are at 3K–5K. Treat the small differences elsewhere as
+roughly unchanged, not additional wins. The 4K prompt saves about
+0.68 seconds relative to the already-tuned previous profile.
+
+In a separate same-binary comparison at the new cutoff, a 6143-token
+prompt took 4.773 s with rounded loans and 4.212 s with exact loans
+(three samples each, +13.3% throughput). The trace confirmed a
+6142-row segment was laid out for 6142 rather than 6144 rows.
+Instrumented smoke requests at 64, 255, 256, 257, and 6143 tokens
+completed. The final CUDA sm_70 and HIP gfx1100 engines built and
+linked; HIP execution was not tested without an AMD device.
+
+The [measurement rows](../benchmarks/v100-small-prefill-2026-10-25.json)
+include binary/prompt hashes, overrides, boundary tests, and rejected
+arms. Larger hybrid cutoffs did not improve the 6K–8K range. Fixed CPU
+shares of 0.30 and 0.75 were slower at 1K; automatic sharing stays on.
+An eight-row CPU down kernel passed bitwise parity and improved its
+microbenchmark but gave no full-engine gain, so it was removed.
+The idle-stage helper arm was slower at 1K and failed at 2K; it is off.
+
+The scheduling and loan changes affect expert placement and CPU/GPU
+rounding. Outputs and draft acceptance can differ. No full-output
+bitwise, model-quality-equivalence, or fixed-work decode claim is made.
+The engine-wide defaults stay unchanged; the measured crossover is
+selected only by this service profile.
+
 ## Decode mixer overlap
 
 Set `STRATA_SIDE_MIXER=2` to test input-only mixer work on graph branches.

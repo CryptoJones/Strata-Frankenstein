@@ -15034,6 +15034,13 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            // Opt-in: price a fresh single-chunk loan at its actual token count. Rounding across the
+            // staged/streamed threshold otherwise borrows a larger ring that the read never uses.
+            // Expert placement can change; unset preserves the rounded layout.
+            static const bool loan_exact = [] {
+                const char* v = std::getenv("STRATA_PREFILL_LOAN_EXACT");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -15046,7 +15053,12 @@ int main(int argc, char** argv) {
                                        : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                      : want_full;
                 // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                const int64_t want_rounded = want;   // what the grid asked for (the trace of an exact loan)
+                // Continuing plans and fixed head-alias layouts retain their original capacity.
+                // Only a segment that fits entirely inside its chunk can use a smaller exact loan.
+                const bool want_exact = loan_exact && exact <= 0 && !o.prefill_head_alias && tokens > 0 && tokens < want;
+                if (want_exact) want = tokens;
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -15125,6 +15137,10 @@ int main(int argc, char** argv) {
                                  (long long) want,
                                  pf_parts.empty() ? -1 : (int) pf_parts[0].first_now, (long long) n_lent,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                    if (want_exact)   // STRATA_PREFILL_LOAN_EXACT: the grid's chunk did not size this loan
+                        std::fprintf(stderr, "strata trace: request loan: STRATA_PREFILL_LOAN_EXACT: a segment of %lld "
+                                             "tokens is laid out for its own read (the chunk rounds to %lld)\n",
+                                     (long long) want, (long long) want_rounded);
                     std::fflush(stderr);
                 }
                 return true;
