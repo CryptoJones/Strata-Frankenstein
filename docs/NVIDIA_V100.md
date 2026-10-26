@@ -674,6 +674,77 @@ Use `STRATA_SELECT_SIMT=0` for the matched control and separate output
 directories for every restart. Preserve the service environment in the
 private harness config.
 
+## Small-prompt prefill
+
+The measured two-V100 profile keeps automatic CPU-assisted prefill
+below 6144 read rows. It sets `STRATA_PREFILL_STREAM_MIN=6144` and
+`STRATA_PREFILL_CPU_SHARE_MAX=6144`; the previous profile used 3072.
+This keeps the hybrid path where it helps without extending it through
+8K, where it lost to the streamed path.
+
+The engine's new opt-in `STRATA_PREFILL_LOAN_EXACT=1` sizes a fresh
+single-chunk loan for its actual read length. Previously, rounding to
+256 rows could cross the staged/streamed cutoff and price a larger ring
+than the read used. The extra loan evicted useful experts. Exact loans
+keep those slots available. Planned continuations and fixed
+`--prefill-head-alias` layouts retain their original capacity.
+Unset or `0` preserves the old layout.
+
+Install the matching engine before using the new service profile.
+Without exact loans, the higher cutoff can still over-borrow near its
+boundary. The engine can hold back a token for the first output, so the
+read segment may be shorter than the total prompt length.
+
+Measured on 2026-10-25: two V100-PCIE-16GB at 175 W, PCIe Gen3 x4/x16,
+Ryzen 5 3600, IQ3_S, INT8 KV, 524288-token capacity, split 16, spec 4,
+pipeline windows 2. Batched MTP and tiled selection were enabled in
+every arm; lean buffers were off. All arms used the same binary and
+matching prompt hashes. Three cold prompts per size were run in the
+order old profile, new profile, old profile again (90 requests).
+
+The baseline below pools the six control samples per size. The new
+column is the median of its three samples. These are prefill times,
+not client time to first output or decode throughput.
+
+| Prompt tokens | Previous profile | New profile | Observed throughput change |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1.182 s | 1.198 s | -1.3% |
+| 2048 | 1.701 s | 1.702 s | -0.1% |
+| 3072 | 2.639 s | 2.265 s | +16.5% |
+| 4096 | 3.558 s | 2.876 s | +23.7% |
+| 5120 | 3.908 s | 3.607 s | +8.3% |
+| 6144 | 4.295 s | 4.231 s | +1.5% |
+| 7168 | 4.750 s | 4.753 s | -0.1% |
+| 8192 | 5.163 s | 5.156 s | +0.1% |
+| 9216 | 6.208 s | 6.243 s | -0.6% |
+| 10240 | 6.643 s | 6.634 s | +0.1% |
+
+The clear gains are at 3K–5K. Treat the small differences elsewhere as
+roughly unchanged, not additional wins. The 4K prompt saves about
+0.68 seconds relative to the already-tuned previous profile.
+
+In a separate same-binary comparison at the new cutoff, a 6143-token
+prompt took 4.773 s with rounded loans and 4.212 s with exact loans
+(three samples each, +13.3% throughput). The trace confirmed a
+6142-row segment was laid out for 6142 rather than 6144 rows.
+Instrumented smoke requests at 64, 255, 256, 257, and 6143 tokens
+completed. The final CUDA sm_70 and HIP gfx1100 engines built and
+linked; HIP execution was not tested without an AMD device.
+
+The [measurement rows](../benchmarks/v100-small-prefill-2026-10-25.json)
+include binary/prompt hashes, overrides, boundary tests, and rejected
+arms. Larger hybrid cutoffs did not improve the 6K–8K range. Fixed CPU
+shares of 0.30 and 0.75 were slower at 1K; automatic sharing stays on.
+An eight-row CPU down kernel passed bitwise parity and improved its
+microbenchmark but gave no full-engine gain, so it was removed.
+The idle-stage helper arm was slower at 1K and failed at 2K; it is off.
+
+The scheduling and loan changes affect expert placement and CPU/GPU
+rounding. Outputs and draft acceptance can differ. No full-output
+bitwise, model-quality-equivalence, or fixed-work decode claim is made.
+The engine-wide defaults stay unchanged; the measured crossover is
+selected only by this service profile.
+
 ## Decode mixer overlap
 
 Set `STRATA_SIDE_MIXER=2` to test input-only mixer work on graph branches.
