@@ -2100,6 +2100,17 @@ double split_help_frac(int64_t T) {
     const double f = std::min(0.45, 0.5 - (double) T / 16384.0);
     return f >= 0.3 ? f : 0.0;
 }
+// STRATA_PREFILL_HELP_MIN=N (opt-in): the helper's own floor in tokens, in place of stream_all_min().
+// The share's cutoff (~3.3K tokens) is measured; a rig whose STRATA_PREFILL_STREAM_MIN sits above it
+// leaves no eligible chunk at all - T < stream_all_min() and frac <= 0 cannot both hold - and the
+// idle stage's GPU is never lent.  Unset: stream_all_min(), the behaviour before this variable.
+int64_t split_help_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HELP_MIN");
+        return e != nullptr && e[0] != '\0' ? std::atoll(e) : (int64_t) -1;
+    }();
+    return v >= 0 ? v : stream_all_min();
+}
 }  // namespace
 
 namespace {
@@ -2163,7 +2174,7 @@ bool Prefill::bind_stage_helper(int64_t T) {
     Impl& m = *impl_;
     if (!m.help_pp || helper_ == nullptr || m.pp) return false;
     const double frac = split_help_frac(T);
-    if (frac <= 0.0 || T < stream_all_min() || m.src == nullptr || m.ring <= 8 || fused_ring()) return false;
+    if (frac <= 0.0 || T < split_help_min() || m.src == nullptr || m.ring <= 8 || fused_ring()) return false;
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     for (int64_t l = stage_lb_; l < stage_le_; ++l) {
         if (!(mmq_plan().any && mmq_plan().layer[(size_t) l])) return false;   // the peer computes on MMQ only
@@ -2819,6 +2830,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    // ms_ple and ms_experts_host are cumulative since setup (Prefill::reset), so this run's own share is printed
+    // as a delta below; printed raw they read as a per-request cost and grow with every request the engine serves
+    const double ple0 = stats_.ms_ple, host0 = stats_.ms_experts_host;
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
@@ -5593,11 +5607,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: CUDA%d layers [%lld,%lld), %lld tokens, GPU timeline %.0f ms, "
                              "wall %.0f ms, host staging %.0f ms, cumulative CPU experts %lld (share %.2f):%s\n",
                      m.device, (long long) stage_lb_, (long long) (stage_le_ < 0 ? m.g->n_layers : stage_le_),
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host,
+                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host - host0,
                      (long long) stats_.experts_cpu, stats_.cpu_share, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
-                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple - ple0);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;

@@ -205,9 +205,19 @@ overlap anyway and no share paid. Measured on 2x RTX 3090 (UD-Q4_K_XL, no P2P), 
 costs no VRAM (the idle card's own prompt buffers) and ~110 KB of mapped host memory per token of the largest chunk it
 helped (~360 MB at 3.3K tokens). The rows it computes round like a different MMQ grouping, so the output is not
 bit-identical to the default's (it is repeatable: same prompt, same output), which is why it is **opt-in**:
-`STRATA_PREFILL_HELP=1` turns it on. On this fork's two V100s the option measured no
-meaningful prefill gain, so it stays off there. Native packs on the MMQ prompt path only (not with the fused prompt kernels,
-`STRATA_PF_FUSED=1`, nor with `--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share.
+`STRATA_PREFILL_HELP=1` turns it on. The helper is eligible only for a chunk of `stream_all_min()` tokens or more,
+which `STRATA_PREFILL_STREAM_MIN` sets (1,024 by default, 2,048 where the tensor-core plan applies); its own share
+reaches zero at ~3.3K tokens. A rig that raises `STRATA_PREFILL_STREAM_MIN` above that has **no eligible chunk at
+all** and the helper silently never runs - it then measures exactly like `STRATA_PREFILL_HELP=0`, which is not the
+same as measuring it off. `STRATA_PREFILL_HELP_MIN=N` gives the helper its own floor in tokens for that case (unset:
+`stream_all_min()`, the behaviour before this variable). It is also mutually exclusive with `STRATA_PREFILL_PROMOTE`:
+setting `STRATA_PREFILL_HELP` turns the promotion off (the engine says so at start), so measure the two apart.
+
+Native packs on the MMQ prompt path only (not with the fused prompt kernels, `STRATA_PF_FUSED=1`, nor with
+`--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share. On this fork's two V100s the helper was
+measured with its window forced open and the engine faults with `prefill: the PLE rows' upload failed: an illegal
+memory access was encountered`, so it stays off there; the earlier "no meaningful prefill gain" note was read on a
+window `STRATA_PREFILL_STREAM_MIN=6144` had already emptied.
 
 The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D1[,D2..]` (the later stages'
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
