@@ -761,6 +761,63 @@ or logical context capacity.
 The [IQ3_S study](../benchmarks/v100-iq3_s-prefill-decode-2026-10-23.md)
 records the boundary regression, performance measurements, and limitations.
 
+## Verify window expert cap
+
+`STRATA_VERIFY_ECAP=N` (opt-in, off by default) caps the expert set of a speculative verify window.
+The window keeps all K picks of token 0. The speculative tail keeps the best `N-K` picks by routing weight.
+A dropped pick joins a kept expert with weight 0. The engine reads no expert for that pick.
+Every combine path multiplies by the routing weight, so a dropped pick adds nothing.
+
+The option changes the output. A dropped low-weight expert of a draft row can flip that row.
+The engine rejects most draft rows, so the read saving is larger than the loss.
+Do not enable it where the answer must be byte-identical.
+
+One expert holds at most `N/K` rows, where `N` is the window's token count.
+The uncapped window gives it the same limit, because a token's top-K names different experts.
+The CPU expert pool holds `MAXT` rows for each expert, and the engine refuses a wider window at startup.
+The kernel keeps that limit. Two kept entries can name the same expert, so the keep list holds different
+experts only and the fold skips an expert that is full.
+
+The option applies to decode windows only. A prompt read through wider windows commits every row,
+so a cap there would drop real experts with no draft to save.
+`N <= K` and a one-token window are no-ops. The default path is unchanged.
+
+Measured on 2026-10-29 on the two-V100 rig below: IQ3_S, INT8 KV, 524288-token capacity, split 16,
+spec 4, pipeline windows 2, the daily service environment, one fresh server per arm, the same binary.
+
+End to end, three independent 32K prompts per arm and 512 greedy tokens each
+(`bench/run_v100_prefill.py`, `temperature=0`):
+
+| Arm | decode, three prompts (tok/s) | median | paired change |
+| --- | ---: | ---: | ---: |
+| off | 90.1 / 115.1 / 91.8 | 91.8 | - |
+| `=20` | 110.5 / 118.1 / 121.5 | 118.1 | +20.4 / +3.0 / +29.7 % |
+| `=16` | 105.7 / 127.9 / 111.9 | 111.9 | +15.6 / +12.8 / +20.1 % |
+
+The mean paired change is +17.7 % at `=20` and +16.2 % at `=16`.
+The same three arms read their 32K prompts in 14051, 14071 and 14048 ms (medians, -0.1 % to +0.1 %),
+so the prompt path does not move.
+
+The engine's own per-window report over a 32K read and a 256-token output shows where the gain comes from:
+
+| Arm | tokens/window | ms/window | decode |
+| --- | ---: | ---: | ---: |
+| off | 2.49 | 35.50 | 70.1 tok/s |
+| `=20` | 2.81 | 36.06 | 77.9 tok/s |
+| `=16` | 3.24 | 36.88 | 87.9 tok/s |
+
+The window's own time does not fall. The committed tokens per window rise, because the cap relaxes the
+verification of the draft rows. The window's missed-expert PCIe wait does fall with it: 3.92 to 2.47
+and 2.19 ms/window on the second stage's GDN layers.
+
+The end-to-end rows of `bench/run_v100_bench.py` are too noisy at 256 output tokens to separate a
+17 % effect: one arm's own repeats span 59 to 94 tok/s at 32K.
+The [measurement rows](../benchmarks/v100-verify-ecap-2026-10-29.json) hold both sets.
+
+The prompt path does not move with the driver knobs either: a 32K read measured 14281 ms off against
+14259 and 14263 ms with `CUDA_SCALE_LAUNCH_QUEUES=4x` and `CUDA_DEVICE_MAX_CONNECTIONS=32`, which is
+the run-to-run spread.
+
 ## More opt-in switches (CUDA 12 experimental build)
 
 Unless stated below, these switches are off by default. The sm_70 table sets `STRATA_PF_WMMA2=1`; each switch was
@@ -792,3 +849,4 @@ for measured gains, fixed settings, and numerical checks.
 | `STRATA_GR_NORM_FAST=1` | the register-split hyper-connection norm on CUDA (#2358) | +0.5-0.6% decode |
 | `STRATA_Q8_GATHER_WIDE=0` | turns off the 8-wide int8 KV gather (#1095) that the experimental build uses below compute capability 7.5 | +11% on the gather kernel |
 | `STRATA_GDN_REC_WARP=2` | Select the chain-split DeltaNet recurrence explicitly. `1` selects the sync-free control. The fork's normal dispatch already uses `STRATA_GDN_REC_FAST` on Volta. For the original pipelined control, set both `STRATA_GDN_REC_WARP=0` and `STRATA_GDN_REC_FAST=0`. `STRATA_GDN_CHUNK=1` selects the chunked path. | Contributor: +6-9% on the recurrence; not a new gain over this fork |
+| `STRATA_VERIFY_ECAP=N` | Caps the verify window's expert set: token 0 keeps all K picks, the tail keeps the top `N-K` by weight, and a dropped pick joins a kept expert at weight 0. Opt-in, decode windows only. It changes the output. | 32K decode, three paired prompts of 512 greedy tokens: +17.7 % at `N=20` and +16.2 % at `N=16`. 2.49 -> 2.81 and 3.24 tokens/window at a flat ms/window. Prompt unchanged. |

@@ -1179,6 +1179,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(route_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_window_parity COMMAND route_window_parity)
 
+  # STRATA_VERIFY_ECAP's redirect: token 0 untouched, kept entries unchanged, dropped entries at weight 0 on a
+  # kept expert, and the same input twice gives the same output (GPU, synthetic, no model)
+  add_executable(ecap_parity src/kernels/ecap_parity.cpp)
+  target_include_directories(ecap_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(ecap_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME ecap_parity COMMAND ecap_parity)
+
   # STRATA_ROUTE_RESIDENT's swap: the warp-per-token kernel against a scalar reference of the same semantics,
   # bitwise on the ids, the weights and the four counters (GPU, synthetic, no model)
   if(STRATA_ENABLE_CUDA)
