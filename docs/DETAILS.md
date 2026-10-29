@@ -2770,6 +2770,44 @@ The gain follows how much of a token is spent waiting for missed experts (hit ra
 split that holds nearly every expert (hit rate 99.7%) gains nothing. It does not touch prompt reading. Switches that stay opt-in and are not part of this:
 `STRATA_ROUTE_PRIOR` (adds speed, doubles the KL), `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_RESIDENT_MTP` (the latter is not faster than the former).
 
+## A verify window's expert set can be capped (opt-in, `STRATA_VERIFY_ECAP`)
+
+`STRATA_VERIFY_ECAP=N` (off by default) caps the experts a speculative verify window reads. Token 0 keeps all K picks.
+The speculative tail (rows 1..T-1) keeps the top `N-K` entries by routing weight; every other entry joins a kept expert
+round-robin with weight 0, so the plan reads no expert for it and every combine path (each multiplies by the routing
+weight) adds exactly zero. Rank is weight descending, then index ascending, so the result is deterministic.
+
+One expert holds at most `T` rows, the window's own token count. That is what the uncapped window gives it, because a
+token's top-K names different experts. Two kept entries can name the same expert, so the keep list holds different
+experts only and the fold skips an expert that is full; if no expert has room, the entry keeps its id and only the
+weight becomes 0. The limit matters: the CPU expert pool keeps `MAXT` rows per expert (`cpu/expert.hpp`,
+`ExpertJobMulti::act/out/nact`), and the engine already refuses a window wider than `MAXT` at start-up.
+
+The option applies to decode windows only (a window no wider than `kVerifyMaxT`). A prompt read through wider windows
+commits every row, so a cap there would drop real experts with no draft to save. `N <= K` and a one-token window are
+no-ops, and the default path is unchanged.
+
+**It changes the output.** A dropped low-weight expert of a draft row can flip that row, and a flipped row can accept a
+draft the exact model would have rejected. Measured on 2026-10-29 on two Tesla V100-PCIE-16GB (GPU0 on PCIe Gen3 x4,
+GPU1 on x16, Ryzen 5 3600), IQ3_S, INT8 KV, 524288-token capacity, `--layer-split 16`, `--spec 4`,
+`--pipeline-windows 2`, the daily service environment, one fresh server per arm and the same binary.
+
+End to end, three independent 32K prompts per arm and 512 greedy tokens each (`bench/run_v100_prefill.py`):
+
+| Arm | decode, three prompts (tok/s) | median | paired change |
+|---|---:|---:|---:|
+| off | 90.1 / 115.1 / 91.8 | 91.8 | - |
+| `=20` | 110.5 / 118.1 / 121.5 | 118.1 | +20.4 / +3.0 / +29.7 % |
+| `=16` | 105.7 / 127.9 / 111.9 | 111.9 | +15.6 / +12.8 / +20.1 % |
+
+The mean paired change is +17.7 % at `=20` and +16.2 % at `=16`; the same arms read their prompts in 14051, 14071 and
+14048 ms, so the prompt path does not move. The engine's own per-window report over a 32K read and a 256-token output
+shows where the gain comes from: the window's own time does not fall (35.50, 36.06 and 36.88 ms/window) while the
+committed tokens per window rise (2.49, 2.81 and 3.24), because the cap relaxes the verification of the draft rows.
+The window's missed-expert PCIe wait does fall with it (3.92 to 2.47 and 2.19 ms/window on the second stage's GDN
+layers). The end-to-end rows of `bench/run_v100_bench.py` are too noisy at 256 output tokens to separate a 17 % effect:
+one arm's own repeats span 59 to 94 tok/s at 32K.
+
 ## The PCIe share of the missed experts is set from the CPU's speed (CUDA, single GPU, no `--pcie-frac`)
 
 Of the experts missing from VRAM, a share goes over PCIe to the GPU and the rest is computed by the CPU pool; `--pcie-frac` sets the share.

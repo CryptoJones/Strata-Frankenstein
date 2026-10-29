@@ -1468,6 +1468,87 @@ __global__ void copy_rows_or_zero_kernel(float4* __restrict__ dst, const volatil
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
     }
 }
+
+// STRATA_VERIFY_ECAP (relaxed MTP, upstream #3545): the verify window's speculative tail (tokens 1..n-1) runs with
+// a capped expert set - token 0 keeps all k picks, the tail keeps the top (cap - k) entries by routing weight.  A
+// dropped entry joins a KEPT expert's group round-robin with weight 0: no expert is read for it that the kept set
+// does not read anyway, its contribution is exactly 0 (every combine path multiplies by w), and the dropped rows
+// spread over the kept groups instead of piling into one (a single large group serializes the grouped GEMV and
+// costs more than the traffic saved).  Rank is (weight desc, index asc) - deterministic.  n <= kResidentPlanMax
+// entries: thread 0 builds the whole decision in shared memory serially (no atomics, no races), the barrier hands
+// every thread its verdict.
+//
+// ONE EXPERT HOLDS AT MOST n/k ROWS.  That is what the uncapped window gives it (a token's top-k names distinct
+// experts, so one token names an expert once) and it is what the consumers are sized for: the CPU expert pool
+// keeps `MAXT` rows per expert (cpu/expert.hpp, `ExpertJobMulti::act/out/nact`, `SplitBufMulti`), and init
+// already refuses a window wider than MAXT (verify.cpp: `max_t > cpu::MAXT`).  Two kept entries can name the same
+// expert, so the keep list is DISTINCT and a full expert is skipped: the fold is spread over the experts that
+// still have room and never takes one past n/k.  An expert that somehow has no room keeps the entry's id and
+// only zeroes the weight: one extra expert read, still an exact zero contribution.
+__global__ void __launch_bounds__(kResidentPlanMax) ecap_redirect_kernel(int32_t* __restrict__ ids,
+                                                                        float* __restrict__ w, int n, int k, int cap) {
+    __shared__ int32_t s_keep[kResidentPlanMax];  // the kept experts, DISTINCT and in routing order
+    __shared__ int s_nkeep;
+    __shared__ int s_verdict[kResidentPlanMax];   // >= 0 the kept expert to fold into, -2 keep as routed,
+                                                  // -3 no expert had room (weight 0, id unchanged)
+    __shared__ int s_rows[kResidentPlanMax];      // the entries each kept expert already names
+    const int tid = threadIdx.x;
+    const int row_max = n / k;                    // the rows one expert may hold: the window's own token count
+    if (tid == 0) {
+        const int keep = cap - k;
+        s_nkeep = 0;
+        for (int i = 0; i < n; ++i) s_verdict[i] = -1;
+        for (int i = 0; i < k; ++i) {             // token 0's picks are always kept, in index order
+            bool seen = false;
+            for (int c = 0; c < s_nkeep; ++c) seen = seen || s_keep[c] == ids[i];
+            if (!seen) s_keep[s_nkeep++] = ids[i];
+            s_verdict[i] = -2;
+        }
+        if (keep > 0) {
+            for (int sel = 0; sel < keep; ++sel) {   // the top-`keep` speculative entries by (w desc, index asc)
+                int best = -1;
+                for (int j = k; j < n; ++j) {
+                    if (s_verdict[j] != -1) continue;
+                    if (best < 0 || w[j] > w[best]) best = j;
+                }
+                if (best < 0) break;
+                s_verdict[best] = -2;             // kept by rank (marker; not folded)
+                bool seen = false;
+                for (int c = 0; c < s_nkeep; ++c) seen = seen || s_keep[c] == ids[best];
+                if (!seen) s_keep[s_nkeep++] = ids[best];
+            }
+        }
+        if (s_nkeep > 0) {
+            for (int c = 0; c < s_nkeep; ++c) s_rows[c] = 0;
+            for (int j = 0; j < n; ++j) {         // what the kept entries already name (token 0's picks too)
+                if (s_verdict[j] != -2) continue;
+                for (int c = 0; c < s_nkeep; ++c)
+                    if (s_keep[c] == ids[j]) { ++s_rows[c]; break; }
+            }
+            int fold = 0;
+            for (int j = k; j < n; ++j) {         // the rest fold round-robin over the kept experts with room
+                if (s_verdict[j] != -1) continue;
+                int pick = -1;
+                for (int c = 0; c < s_nkeep; ++c) {
+                    const int q = (fold + c) % s_nkeep;
+                    if (s_rows[q] < row_max) { pick = q; fold = q + 1; break; }
+                }
+                if (pick < 0) { s_verdict[j] = -3; continue; }
+                ++s_rows[pick];
+                s_verdict[j] = pick;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid >= n || s_nkeep <= 0) return;
+    const int v = s_verdict[tid];
+    if (v >= 0) {                                 // dropped: fold into kept expert v, zero weight
+        ids[tid] = s_keep[v];
+        w[tid] = 0.0f;
+    } else if (v == -3) {                         // no room anywhere: keep the id, contribute nothing
+        w[tid] = 0.0f;
+    }
+}
 }  // namespace
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
@@ -1476,6 +1557,12 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                               blob, plan, capx, skip, ring, plan_err);
     check("resident_plan");
+}
+void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream) {
+    if (n <= k || cap <= k) return;              // a single token's window, or nothing to drop
+    if (n > kResidentPlanMax) return;            // more entries than the kernel's tables: leave the window alone
+    ecap_redirect_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, w, n, k, cap);
+    check("verify_ecap");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
