@@ -2787,6 +2787,28 @@ The option applies to decode windows only (a window no wider than `kVerifyMaxT`)
 commits every row, so a cap there would drop real experts with no draft to save. `N <= K` and a one-token window are
 no-ops, and the default path is unchanged.
 
+**The cap only acts when the window's tail is longer than `N-K`.** The keep list is token 0's K picks plus the best
+`N-K` tail entries; when the tail holds `N-K` entries or fewer, nothing is dropped and the option is a no-op. The
+window's width is not fixed: `--spec` sets a ceiling and `--spec-min-p` trims it per token. On this rig's daily
+service (the server's default sampling, temperature 1.0) the engine offers `avg T` 1.82, 1.84 and 2.01 over three
+512-token requests, so with K=10 the tail holds 8-10 entries and **`N=20` keeps all of them and does nothing**.
+`N=16` keeps 6 and drops 2-4. Choose `N` from the workload's measured `avg T`, not from the `--spec` ceiling.
+
+Measured on the live service at that window width, `bench/run_v100_bench.py --only 32K --seed 42 --max-tokens 256
+--repeats 4`, the service restarted per arm:
+
+| Arm | decode, four 32K requests (tok/s) | mean |
+|---|---:|---:|
+| off | 63.2 / 72.4 / 75.9 / 74.3 | 71.5 |
+| `=16` | 99.9 / 79.9 / 74.3 / 64.5 | 79.7 |
+| off again | 60.2 / 63.6 / 72.4 / 68.8 | 66.2 |
+| `=16` again | 67.7 / 68.8 / 65.7 / 93.4 | 73.9 |
+
+The two drift-paired comparisons give +11.5 % and +11.5 %. The two control arms drifted 8 % apart over the run and
+the per-request spread is 60 to 100 tok/s, so read that as about +11 % with a wide error bar: the pooled medians of
+the same eight samples move only +2.8 %. The prompt path is unchanged in every arm.
+[The rows](../benchmarks/v100-verify-ecap-window-width-2026-10-29.json) hold both sets.
+
 **It changes the output.** A dropped low-weight expert of a draft row can flip that row, and a flipped row can accept a
 draft the exact model would have rejected. Measured on 2026-10-29 on two Tesla V100-PCIE-16GB (GPU0 on PCIe Gen3 x4,
 GPU1 on x16, Ryzen 5 3600), IQ3_S, INT8 KV, 524288-token capacity, `--layer-split 16`, `--spec 4`,

@@ -782,6 +782,14 @@ The option applies to decode windows only. A prompt read through wider windows c
 so a cap there would drop real experts with no draft to save.
 `N <= K` and a one-token window are no-ops. The default path is unchanged.
 
+The cap only acts when the window's tail is longer than `N-K`: the keep list is token 0's K picks plus the best
+`N-K` tail entries, so a window with `N-K` tail entries or fewer loses nothing. The window's width is not fixed;
+`--spec-min-p` trims it per token. The daily service, which samples at temperature 1.0, offers `avg T` 1.82, 1.84
+and 2.01 over three 512-token requests, so with K=10 the tail holds 8-10 entries and `N=20` is a no-op there.
+Choose `N` from the workload's measured `avg T`. At that width on the live service, `N=16` gave +11.5 % and
++11.5 % in two drift-paired comparisons of four 32K requests each (the two control arms drifted 8 % apart, and the
+pooled medians move +2.8 %, so the error bar is wide).
+
 Measured on 2026-10-29 on the two-V100 rig below: IQ3_S, INT8 KV, 524288-token capacity, split 16,
 spec 4, pipeline windows 2, the daily service environment, one fresh server per arm, the same binary.
 
