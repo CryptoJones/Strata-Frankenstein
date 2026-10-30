@@ -2,6 +2,7 @@
 #include "strata/core/foreign_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -159,6 +160,16 @@ bool ForeignExperts::open(std::shared_ptr<HelperWorkerLibrary> lib, int device, 
     device_ = device;
     const auto& lay = strata::kernels::cpu::expert_layout();
     native_ = lay.native;
+    // APR (prism.hadamard) packs store their experts in a block-Hadamard-rotated basis: every path that feeds them
+    // rotates its activations first (RemoteExperts::begin, the CPU pool, the prompt path).  Worker ABI v1 carries
+    // neither the block size nor the sign vectors, and a worker that skips the rotation returns plausible-looking
+    // garbage (hadamard.hpp), so such a pack is refused here, as the prompt peer refuses it in Prefill::set_peer.
+    if (strata::kernels::cpu::hadamard_spec().any()) {
+        err = label_ + " experts: this pack's experts are Hadamard-folded (APR, block " +
+              std::to_string(strata::kernels::cpu::hadamard_spec().block) +
+              "); helper worker ABI v1 cannot apply the rotation, so a worker cannot serve it";
+        close(); return false;
+    }
     double free_gib = 0;
     if (!preflight(*lib_, device, free_gib, err)) { close(); return false; }
     const uint64_t free_bytes = (uint64_t) (free_gib * 1073741824.0);

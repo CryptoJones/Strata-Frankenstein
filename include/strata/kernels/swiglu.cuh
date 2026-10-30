@@ -21,6 +21,8 @@
 
 #include <cuda_runtime.h>
 
+#include "strata/kernels/portable_expf.cuh"   // STRATA_SWIGLU_EXPF: the expert SwiGLU's exp (portable with STRATA_PORTABLE_EXPF)
+
 namespace strata::kernels {
 
 /// `out = (float)((double)g / (1.0 + exp(-(double)g))) * u` - `shared_expert.cu`'s `swiglu_kernel`.
@@ -29,9 +31,12 @@ __device__ __forceinline__ float swilu_legacy(float g, float u) {
     return (float) (x / (1.0 + exp(-x))) * u;
 }
 
-/// `out = (g / (1.0f + __expf(-g))) * u` - `s2_expert_grouped.cu`'s `swiglu_kernel`.
+/// `out = (g / (1.0f + __expf(-g))) * u` - `s2_expert_grouped.cu`'s `swiglu_kernel`.  The exp is STRATA_SWIGLU_EXPF,
+/// as in that kernel: with STRATA_PORTABLE_EXPF the routed experts' SwiGLU rounds the same on NVIDIA and AMD, and a
+/// fused epilogue that reproduces the kernel bit for bit has to follow it (the HIP helper worker returns the CUDA
+/// kernels' bytes only if every copy of this expression does).
 __device__ __forceinline__ float swilu_fast(float g, float u) {
-    return (g / (1.0f + __expf(-g))) * u;
+    return (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * u;
 }
 
 /// `out = __fdividef(g, 1.0f + __expf(-g)) * u` - `shared_expert.cu`'s `native_swiglu_kernel`.

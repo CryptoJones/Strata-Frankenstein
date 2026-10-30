@@ -4463,7 +4463,8 @@ int main(int argc, char** argv) {
 #else
         on = false;
 #endif
-        const bool helpers_a = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        const bool helpers_a = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
+                               foreign_helper;
         on = on && !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && o.peer_device < 0 && !helpers_a && !o.adapt_async;
         o.pipeline_windows = on ? 2 : 0;
         if (on)
@@ -6004,8 +6005,8 @@ int main(int argc, char** argv) {
         if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\0' && pn[0] != '0') {
             const char* off_why = profile.empty() ? "it needs --expert-profile (the ranking)"
                                 : multi_gpu || o.peer_device >= 1 ? "not with a layer split or a peer GPU"
-                                : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                              [](int n) { return n > 0; }) ? "not with helper caches on other GPUs"
+                                : (std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                               [](int n) { return n > 0; }) || foreign_helper) ? "not with helper caches on other GPUs"
                                 : nullptr;
             if (off_why != nullptr) {
                 std::fprintf(stderr, "strata generate: pin by need: off (%s); the prefix pinning stays\n", off_why);
@@ -8486,6 +8487,12 @@ int main(int argc, char** argv) {
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (remote_experts[(size_t) r].holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         }
+        // Frankenstein: the worker's device is a helper GPU too (in shadow mode holds() is false by design: the
+        // run's RAM copy is then the one without the worker, which the identity test compares against).
+        if (foreign)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (foreign->holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         // The split's lend regions.  The serve scan lends the tail slots of EVERY part's cache - CUDA0's own
         // part first, then every stage (the `pf_parts` loop below) - and `lend_from` above is switched off in
         // pin_cache_complement the moment `additional_gpu_pairs` is non-empty, so until now none of those experts
@@ -15433,6 +15440,7 @@ int main(int argc, char** argv) {
                     // (--remote-expert-opt works only through a helper cache, so without one it does not count)
                     s.helper_caches = prefill_src != srcp;
                     for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
+                    s.helper_caches |= foreign_helper;   // Frankenstein: the worker's device counts as one
                     s.staged_source = srcp == &src && src.stages_blobs();
                     s.other_source = srcp != &src && srcp != &arena_src;
                     if (const char* why = strata::program::concurrent_read_off(s)) {
