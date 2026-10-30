@@ -2100,6 +2100,17 @@ double split_help_frac(int64_t T) {
     const double f = std::min(0.45, 0.5 - (double) T / 16384.0);
     return f >= 0.3 ? f : 0.0;
 }
+// STRATA_PREFILL_HELP_MIN=N (opt-in): the helper's own floor in tokens, in place of stream_all_min().
+// The share's cutoff (~3.3K tokens) is measured; a rig whose STRATA_PREFILL_STREAM_MIN sits above it
+// leaves no eligible chunk at all - T < stream_all_min() and frac <= 0 cannot both hold - and the
+// idle stage's GPU is never lent.  Unset: stream_all_min(), the behaviour before this variable.
+int64_t split_help_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HELP_MIN");
+        return e != nullptr && e[0] != '\0' ? std::atoll(e) : (int64_t) -1;
+    }();
+    return v >= 0 ? v : stream_all_min();
+}
 }  // namespace
 
 namespace {
@@ -2161,20 +2172,46 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
 // (that stage idles until this one hands its rows over).  False when it cannot help this prompt.
 bool Prefill::bind_stage_helper(int64_t T) {
     Impl& m = *impl_;
-    if (!m.help_pp || helper_ == nullptr || m.pp) return false;
+    // Why a prompt did not get the idle stage, said each time: the helper is opt-in, and "on but every prompt was
+    // refused" and "off" look identical from outside - which is what hid this for so long under STRATA_PREFILL_HELP=1.
+    auto no = [&](const std::string& why) {
+        std::fprintf(stderr, "strata prefill: the idle stage does not help this %lld-token prompt: %s\n",
+                     (long long) T, why.c_str());
+        return false;
+    };
+    if (!m.help_pp || helper_ == nullptr) return no("STRATA_PREFILL_HELP armed no helper for this stage");
+    if (m.pp) return no("a peer is already active");
     const double frac = split_help_frac(T);
-    if (frac <= 0.0 || T < stream_all_min() || m.src == nullptr || m.ring <= 8 || fused_ring()) return false;
+    if (frac <= 0.0) return no("the share is 0 at this chunk size (split_help_frac)");
+    if (T < split_help_min()) return no("the chunk is below the helper's floor (" + std::to_string(split_help_min()) + " tokens)");
+    if (m.src == nullptr) return no("this stage has no expert source");
+    if (m.ring <= 8) return no("this stage's ring is " + std::to_string(m.ring) + " slots (<= 8)");
+    if (fused_ring()) return no("the fused prompt kernels are in use");
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     for (int64_t l = stage_lb_; l < stage_le_; ++l) {
-        if (!(mmq_plan().any && mmq_plan().layer[(size_t) l])) return false;   // the peer computes on MMQ only
-        if (lay.native && fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type)) return false;
+        if (!(mmq_plan().any && mmq_plan().layer[(size_t) l]))   // the peer computes on MMQ only
+            return no("layer " + std::to_string((long long) l) + " is not on the MMQ prompt path");
+        if (lay.native && fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type))
+            return no("layer " + std::to_string((long long) l) + " runs the fused native kernels");
     }
     Impl& h = *helper_->impl_;
     // the helper's buffers must be laid out for this chunk (the serve path lends every stage's at once)
-    if (h.T < T || h.mixed == nullptr || h.Hq == nullptr || h.GU == nullptr || h.H == nullptr ||
-        h.Dm == nullptr || h.src_dev == nullptr || h.ids_identity == nullptr || h.bounds_dev == nullptr ||
-        h.grp_gu == nullptr || h.grp_d == nullptr || !h.mmq_ctx || h.ring <= 8)
-        return false;
+    if (h.T < T)
+        return no("the helper's buffers are for " + std::to_string((long long) h.T) + " tokens, this chunk is " +
+                  std::to_string((long long) T));
+    if (h.mixed == nullptr || h.Hq == nullptr || h.GU == nullptr || h.H == nullptr || h.Dm == nullptr ||
+        h.src_dev == nullptr || h.ids_identity == nullptr || h.bounds_dev == nullptr || h.grp_gu == nullptr ||
+        h.grp_d == nullptr || !h.mmq_ctx)
+        return no("the helper's prompt buffers are not all laid out");
+    if (h.ring <= 8) return no("the helper's ring is " + std::to_string(h.ring) + " slots (<= 8)");
+    // Binds from here on: say so once, so "the helper ran" and "every prompt was refused" cannot be confused - the
+    // engine exits on a CUDA fault before any timing line, which is how this was misread once already.
+    static bool said_bound = false;
+    if (!said_bound) {
+        said_bound = true;
+        std::fprintf(stderr, "strata prefill: the idle stage (CUDA%d) helps this %lld-token prompt, share %.2f of its "
+                             "streamed experts\n", h.device, (long long) T, frac);
+    }
     PeerPrefill& P = *m.help_pp;
     P.T_max = T;
     P.cap_rows = T * K;
@@ -2188,9 +2225,19 @@ bool Prefill::bind_stage_helper(int64_t T) {
         // the helper uses at most T rows, so its quantized inputs fit after those GU rows.
         const size_t xq_bytes = mmq::q8_bytes(T, N);
         const size_t hq_bytes = mmq::q8_bytes(T, 640);
-        if (K < 2 || xq_bytes + hq_bytes > (size_t) T * (K - 1) * 1280 * sizeof(float)) return false;
+        if (K < 2 || xq_bytes + hq_bytes > (size_t) T * (K - 1) * 1280 * sizeof(float))
+            return no("the helper's GU has no room for the peer's quantized inputs");
         P.Xq_g = reinterpret_cast<uint8_t*>(h.GU + (size_t) T * 1280);
         P.Hq_g = static_cast<uint8_t*>(P.Xq_g) + xq_bytes;
+        // ...and H.  With no H buffer of its own this stage hands the peer `xn16`, which holds T*(D+pad)
+        // uint16 = (D+pad)/2 floats a token, while the peer writes up to cap_rows*640 floats there (its
+        // swiglu and quantize run per MMQ group, over the group's rows).  A pack whose K*640 exceeds
+        // (D+pad)/2 would write past the buffer, so refuse it here: V100 + IQ3_S needs 6,400 floats a token
+        // against 1,312, which is what made STRATA_PREFILL_HELP=1 die with an illegal memory access.
+        const size_t h_floats = (size_t) T * (D + (hc_pad() ? XN_PAD : 0)) / 2;
+        if ((size_t) P.cap_rows * 640 > h_floats)
+            return no("the helper's H holds " + std::to_string(h_floats) + " floats, the peer writes " +
+                      std::to_string((size_t) P.cap_rows * 640) + " (K*640 a token)");
     }
     P.GU_g = h.GU;
     P.H_g = h.H;
@@ -2819,6 +2866,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    // ms_ple and ms_experts_host are cumulative since setup (Prefill::reset), so this run's own share is printed
+    // as a delta below; printed raw they read as a per-request cost and grow with every request the engine serves
+    // experts_streamed/streamed_bytes are cumulative the same way, and are the bytes this run moved over PCIe
+    const double ple0 = stats_.ms_ple, host0 = stats_.ms_experts_host;
+    const int64_t blobs0 = stats_.experts_streamed, bytes0 = stats_.streamed_bytes;
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
@@ -3236,6 +3288,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.stager->issued_one(en.job, m.copy);
                     }
                     ++stats_.experts_streamed;   // only an actual transfer is counted
+                    stats_.streamed_bytes += (int64_t) bytes;
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
                 m.stage_live[sl] = true;
@@ -3254,7 +3307,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
-        int64_t iss_streamed = 0, iss_dma = 0;
+        int64_t iss_streamed = 0, iss_dma = 0, iss_bytes = 0;
         std::thread issuer;
         struct IssuerJoin {
             std::atomic<bool>* stop;
@@ -3293,6 +3346,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.stager->issued_one(en.job, m.copy);
                         }
                         ++iss_streamed;   // only an actual transfer is counted
+                        iss_bytes += (int64_t) bytes;
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
                     m.stage_live[sl] = true;
@@ -4808,6 +4862,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
+                            stats_.streamed_bytes += (int64_t) lay.blob_bytes(l);
                             return true;
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
@@ -5414,6 +5469,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
+            stats_.streamed_bytes += iss_bytes;
         }
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
@@ -5591,13 +5647,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             line += b;
         }
         std::fprintf(stderr, "strata prefill timing: CUDA%d layers [%lld,%lld), %lld tokens, GPU timeline %.0f ms, "
-                             "wall %.0f ms, host staging %.0f ms, cumulative CPU experts %lld (share %.2f):%s\n",
+                             "wall %.0f ms, host staging %.0f ms, %lld blobs streamed (%.2f GiB over PCIe), "
+                             "cumulative CPU experts %lld (share %.2f):%s\n",
                      m.device, (long long) stage_lb_, (long long) (stage_le_ < 0 ? m.g->n_layers : stage_le_),
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host,
+                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host - host0,
+                     (long long) (stats_.experts_streamed - blobs0),
+                     (double) (stats_.streamed_bytes - bytes0) / (1024.0 * 1024.0 * 1024.0),
                      (long long) stats_.experts_cpu, stats_.cpu_share, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
-                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+                             "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple - ple0);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
