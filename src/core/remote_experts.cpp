@@ -383,7 +383,7 @@ bool RemotePrefillSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst)
         const int32_t l = (int32_t) layer, e = (int32_t) expert;
         uint8_t* d = dst;
         std::string err;
-        for (RemoteExperts* h : helpers_) {
+        for (IExpertHelper* h : helpers_) {
             uint8_t got = 0;
             const bool ok = h->copy_cached_blobs(&l, &e, &d, 1, &got, err);
             if (got) {
