@@ -5571,10 +5571,14 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
+                        with self.status_lock:
+                            self.totals["reasoning_loop_stops"] = self.totals.get("reasoning_loop_stops", 0) + 1
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
+                        with self.status_lock:
+                            self.totals["repeated_token_stops"] = self.totals.get("repeated_token_stops", 0) + 1
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
@@ -5699,8 +5703,15 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(tail_events):
             yield "event", ev
+        with self.status_lock:
+            for key, value in (
+                ("tool_calls_from_reasoning", parser.rescued),
+                ("tool_calls_kept_as_reasoning", parser.refused),
+                ("tool_call_openers_repaired", getattr(parser, "repaired_openers", 0)),
+                ("reasoning_recoveries", recovery_count),
+            ):
+                self.totals[key] = self.totals.get(key, 0) + value
         if parser.rescued or parser.refused:
-            self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
