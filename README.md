@@ -1,4 +1,16 @@
-# Strata-V100
+# StraylightSprawl™
+
+**One mixture-of-experts inference engine spread across mismatched GPUs.** StraylightSprawl is a fork of [Strata-V100](https://github.com/jmnargi/Strata-V100) (itself a fork of [Strata](https://github.com/Niko1221/Strata)) that lets AMD cards (ROCm/HIP) serve MoE experts as helpers next to the NVIDIA (CUDA) cards that run the engine.
+
+- **Expert helper ABI** (`strata_helper_api_v1`): a vendor-neutral C interface, with workers loaded at run time via `dlopen`.
+- **HIP helper worker** (`libstrata_helper_hip.so`): grouped native and S2 expert kernels on an AMD card. Its output is byte-identical to the CUDA expert kernels when built with `-DSTRATA_PORTABLE_EXPF=ON` (validated on a Radeon Pro V620).
+- **CPU reference worker**, `--helper-shadow` identity mode, and `tests/helper/hip_worker_parity.cpp` for checking parity, timing and CUDA+ROCm coexistence.
+
+The binary and CMake project are still named `strata`; everything below is the upstream Strata-V100 README.
+
+---
+
+## Upstream: Strata-V100
 
 **A community-maintained V100-focused fork of [Strata](https://github.com/Niko1221/Strata).** This fork keeps NVIDIA Volta (`sm_70`) support working, develops and measures performance changes on Tesla V100 hardware, and periodically merges upstream improvements for features and fixes beyond V100.
 
