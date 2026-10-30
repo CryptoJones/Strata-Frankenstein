@@ -10,9 +10,10 @@
 // group metadata and runs the same grouped expert kernels the CUDA helper runs, then copies the packed output rows
 // back into its pinned host buffer.  finish() waits for the stream and hands that buffer to the engine.
 //
-// What is deliberately NOT here: zero-copy mapped host buffers (RemoteExperts' STRATA_REMOTE_ZEROCOPY), because the
-// mapped path on gfx1030 is unmeasured (the fork note), and the engine's pinned arena, which belongs to the CUDA
-// runtime - blobs arrive as pageable host pointers and are staged by hipMemcpy.
+// Zero-copy mapped host buffers (RemoteExperts' STRATA_REMOTE_ZEROCOPY) are STRATA_HELPER_ZEROCOPY here, and the
+// blocking finish has a polling alternative, STRATA_HELPER_SPIN (see the device struct).  What is deliberately NOT
+// here: the engine's pinned arena, which belongs to the CUDA runtime - blobs arrive as pageable host pointers and
+// are staged by hipMemcpy.
 #include "strata/helper/strata_helper_abi.h"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -78,10 +79,23 @@ struct strata_helper_device {
     uint64_t arena_bytes = 0;
     // streams and buffers
     cudaStream_t stream = nullptr;
-    float* h_x = nullptr;                // pinned: max_tokens * n_embd
-    float* h_out = nullptr;              // pinned: max_entries * n_embd
+    float* h_x = nullptr;                // pinned, mapped: max_tokens * n_embd
+    float* h_out = nullptr;              // pinned, mapped: max_entries * n_embd
     float* d_x = nullptr;
     float* d_out = nullptr;
+    // Zero-copy (STRATA_HELPER_ZEROCOPY=1): the kernels read the activation rows from, and write the packed output
+    // rows into, the mapped pinned host buffers directly, so the two per-layer copies go away.  OFF by default: on a
+    // V620 over Thunderbolt 3 the kernels' mapped reads cost far more than the copies they replace (1 token: kernel
+    // 86 -> 699 us; 8 tokens: 530 -> 5275 us), so this stays a knob for a bus where it may pay (OCuLink, a slot).
+    // z_x / z_out are the device views of h_x / h_out; null when the mapping is unavailable.
+    bool zero_copy = false;
+    float* z_x = nullptr;
+    float* z_out = nullptr;
+    // STRATA_HELPER_SPIN (default 1): finish() polls the stream instead of blocking in cudaStreamSynchronize.  When
+    // the engine calls finish() after the GPU is already done - the CPU pool took longer, the case the helper is for -
+    // the blocking wait returned in 153 us median (max 193) on the V620, the poll in 30 us (max 65).  Waiting on a
+    // busy GPU costs the same either way.  =0 keeps the blocking sync.
+    bool spin = true;
     uint8_t* d_q8 = nullptr;
     float* d_scales = nullptr;
     void* d_scratch = nullptr;
@@ -192,8 +206,8 @@ int w_open(int device, const strata_helper_open_params* p, strata_helper_device*
     const bool ok =
         check(cudaMalloc((void**) &d->arena, off), "slot arena", err, cap) &&
         check(cudaStreamCreateWithFlags(&d->stream, cudaStreamNonBlocking), "stream", err, cap) &&
-        check(cudaHostAlloc((void**) &d->h_x, T * H * sizeof(float), cudaHostAllocPortable), "input staging", err, cap) &&
-        check(cudaHostAlloc((void**) &d->h_out, CAP * H * sizeof(float), cudaHostAllocPortable), "result staging", err, cap) &&
+        check(cudaHostAlloc((void**) &d->h_x, T * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, cap) &&
+        check(cudaHostAlloc((void**) &d->h_out, CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err, cap) &&
         check(cudaHostAlloc(&d->h_meta, d->meta_bytes, cudaHostAllocPortable), "metadata staging", err, cap) &&
         check(cudaMalloc((void**) &d->d_x, T * H * sizeof(float)), "input", err, cap) &&
         check(cudaMalloc((void**) &d->d_out, CAP * H * sizeof(float)), "result", err, cap) &&
@@ -202,10 +216,24 @@ int w_open(int device, const strata_helper_open_params* p, strata_helper_device*
         check(cudaMalloc(&d->d_scratch, scratch), "scratch", err, cap) &&
         check(cudaMalloc(&d->d_meta, d->meta_bytes), "group metadata", err, cap);
     if (!ok) return 1;
+    // STRATA_HELPER_ZEROCOPY=1 / 0 forces the mode; unset takes the default below.  The mapping itself can fail on a
+    // device or driver without host-coherent access: then the copies stay, whatever was asked.
+    {
+        const char* zc = std::getenv("STRATA_HELPER_ZEROCOPY");
+        const bool want = zc != nullptr && zc[0] != '\0' ? zc[0] == '1' : false;
+        if (want) {
+            d->zero_copy = cudaHostGetDevicePointer((void**) &d->z_x, d->h_x, 0) == cudaSuccess &&
+                           cudaHostGetDevicePointer((void**) &d->z_out, d->h_out, 0) == cudaSuccess;
+            cudaGetLastError();
+            if (!d->zero_copy) { d->z_x = d->z_out = nullptr; }
+        }
+    }
+    if (const char* sp = std::getenv("STRATA_HELPER_SPIN"); sp != nullptr && sp[0] != '\0') d->spin = sp[0] == '1';
     if (const char* t = std::getenv("STRATA_HELPER_TIMING"); t && t[0] == '1') {
         d->timing = true;
         for (cudaEvent_t& e : d->ev)
             if (!check(cudaEventCreate(&e), "timing event", err, cap)) return 1;
+        std::fprintf(stderr, "helper-open backend=%s device=%d zero_copy=%d spin=%d\n", kBackend, device, (int) d->zero_copy, (int) d->spin);
     }
     meta_layout((int64_t) CAP, d->dm, (uint8_t*) d->d_meta);
     meta_layout((int64_t) CAP, d->hm, (uint8_t*) d->h_meta);
@@ -293,23 +321,27 @@ int w_begin(strata_helper_device* d, const strata_helper_launch* L, char* err, s
         d->timed_tok = (int32_t) L->n_tok;
         cudaEventRecord(d->ev[0], s);
     }
-    if (!check(cudaMemcpyAsync(d->d_x, d->h_x, (size_t) L->n_tok * H * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, cap) ||
+    const float* x_in = d->zero_copy ? d->z_x : d->d_x;      // what the quantizer reads
+    float* out_dev = d->zero_copy ? d->z_out : d->d_out;     // where the down projection writes its packed rows
+    if ((!d->zero_copy &&
+         !check(cudaMemcpyAsync(d->d_x, d->h_x, (size_t) L->n_tok * H * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, cap)) ||
         !check(cudaMemcpyAsync(d->d_meta, d->h_meta, d->meta_bytes, cudaMemcpyHostToDevice, s), "copy group metadata", err, cap))
         return 1;
     if (d->timing) cudaEventRecord(d->ev[1], s);
     if (d->native) {
-        strata::kernels::quantize_q8_1_rows(d->d_x, L->n_tok, (int64_t) H, d->d_q8, s);
+        strata::kernels::quantize_q8_1_rows(x_in, L->n_tok, (int64_t) H, d->d_q8, s);
         auto lay = strata::kernels::native_expert_layout(L->gu_type, L->d_type, d->n_embd, d->n_ff);
         strata::kernels::native_expert_grouped(lay, d->dm.ptr, d->dm.start, d->dm.count, d->dm.dst, d->dm.tok,
-                                               n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scratch, d->d_out, s);
+                                               n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scratch, out_dev, s);
     } else {
-        strata::kernels::quantize_q8_0_scaled(d->d_x, d->d_q8, d->d_scales, L->n_tok * (int64_t) H, s);
+        strata::kernels::quantize_q8_0_scaled(x_in, d->d_q8, d->d_scales, L->n_tok * (int64_t) H, s);
         strata::kernels::moe_grouped_s2(d->dm.ptr, d->dm.start, d->dm.count, d->dm.dst, d->dm.tok,
-                                        n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scales, d->d_scratch, d->d_out, s);
+                                        n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scales, d->d_scratch, out_dev, s);
     }
     if (!check(cudaGetLastError(), "expert kernels", err, cap)) return 1;
     if (d->timing) cudaEventRecord(d->ev[2], s);
-    if (!check(cudaMemcpyAsync(d->h_out, d->d_out, (size_t) L->n_entries * H * sizeof(float), cudaMemcpyDeviceToHost, s), "copy results", err, cap))
+    if (!d->zero_copy &&
+        !check(cudaMemcpyAsync(d->h_out, d->d_out, (size_t) L->n_entries * H * sizeof(float), cudaMemcpyDeviceToHost, s), "copy results", err, cap))
         return 1;
     if (d->timing) cudaEventRecord(d->ev[3], s);
     d->pending = true;
@@ -323,7 +355,14 @@ int w_finish(strata_helper_device* d, const float** rows, char* err, size_t cap)
     if (d->n_entries > 0) {
         DeviceScope scope(d->device);
         if (!scope.ok) return fail(err, cap, std::string(kBackend) + " worker: device switch failed");
-        if (!check(cudaStreamSynchronize(d->stream), "finish", err, cap)) return 1;
+        if (d->spin) {
+            cudaError_t e;
+            while ((e = cudaStreamQuery(d->stream)) == cudaErrorNotReady) {
+            }
+            if (!check(e, "finish", err, cap)) return 1;
+        } else if (!check(cudaStreamSynchronize(d->stream), "finish", err, cap)) {
+            return 1;
+        }
         if (d->timing) {
             float ms[3] = {};
             for (int i = 0; i < 3; ++i) cudaEventElapsedTime(&ms[i], d->ev[i], d->ev[i + 1]);

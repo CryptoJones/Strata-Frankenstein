@@ -5023,25 +5023,37 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // MODEL-UPDATE: on by default on gfx12 (every output the old kernels' bits; R9700, UD-Q4_K_XL decode, 5 interleaved
     // pairs: story +1.2% 5/5, code +0.8% 5/5, after 6K +0.2% 4/5); STRATA_EXPERT_V2K=0 turns it off, =1 turns it on
     // elsewhere (not measured on other cards)
+    // gfx1030 (StraylightSprawl: a Radeon Pro V620 as the HIP helper worker beside CUDA cards) takes V2K and STRATA_TSUM
+    // by default too: on real UD-Q4_K_XL blobs, byte-identical to the CUDA kernels (hip_worker_parity), kernel time per
+    // layer call 1 tok 86 -> 88 us, 5 tok 265 -> 242, 8 tok 530 -> 499, 64 tok 2379 -> 1619.  STRATA_TSUM=0 keeps the
+    // warp sums there.
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    static const int hip_arch = [] {   // 12: gfx12 (R9700 ...), 1030: gfx1030 (V620, RX 6800/6900), 0: anything else
+        int dev = 0, a = 0;
+        cudaDeviceProp p;
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess)
+            a = strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 12
+              : strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1030") ? 1030 : 0;
+        (void) cudaGetLastError();
+        return a;
+    }();
+#else
+    constexpr int hip_arch = 0;
+#endif
     static const bool v2k = [] {
         const char* v = std::getenv("STRATA_EXPERT_V2K");
         if (v != nullptr && v[0] != '\0') return v[0] == '1';
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-        int dev = 0;
-        cudaDeviceProp p;
-        const bool g12 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                         strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
-        (void) cudaGetLastError();
-        return g12;
-#else
-        return false;
-#endif
+        return hip_arch == 12 || hip_arch == 1030;
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
     if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
-        static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+        static const bool ts = [] {   // STRATA_TSUM; unset: on for gfx1030 (see above), off elsewhere
+            const char* v = std::getenv("STRATA_TSUM");
+            if (v != nullptr && v[0] != '\0') return v[0] == '1';
+            return hip_arch == 1030;
+        }();
         const long long nh = (long long) cap_entries * L.n_ff;
 #define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
         if (q36geo) {
