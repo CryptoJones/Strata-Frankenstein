@@ -83,15 +83,19 @@ struct strata_helper_device {
     float* h_out = nullptr;              // pinned, mapped: max_entries * n_embd
     float* d_x = nullptr;
     float* d_out = nullptr;
-    // Zero-copy (STRATA_HELPER_ZEROCOPY): the kernels read the activation rows from, and write the packed output
-    // rows into, the mapped pinned host buffers directly - the two per-layer copies (each a PCIe round trip and a
-    // launch) go away.  z_x / z_out are the device views of h_x / h_out; null when the mapping is unavailable.
+    // Zero-copy (STRATA_HELPER_ZEROCOPY=1): the kernels read the activation rows from, and write the packed output
+    // rows into, the mapped pinned host buffers directly, so the two per-layer copies go away.  OFF by default: on a
+    // V620 over Thunderbolt 3 the kernels' mapped reads cost far more than the copies they replace (1 token: kernel
+    // 86 -> 699 us; 8 tokens: 530 -> 5275 us), so this stays a knob for a bus where it may pay (OCuLink, a slot).
+    // z_x / z_out are the device views of h_x / h_out; null when the mapping is unavailable.
     bool zero_copy = false;
     float* z_x = nullptr;
     float* z_out = nullptr;
-    // STRATA_HELPER_SPIN: finish() polls the stream instead of blocking in cudaStreamSynchronize, whose wake-up
-    // latency (HIP keeps its default scheduling policy) is comparable to a decode-sized launch itself.
-    bool spin = false;
+    // STRATA_HELPER_SPIN (default 1): finish() polls the stream instead of blocking in cudaStreamSynchronize.  When
+    // the engine calls finish() after the GPU is already done - the CPU pool took longer, the case the helper is for -
+    // the blocking wait returned in 153 us median (max 193) on the V620, the poll in 30 us (max 65).  Waiting on a
+    // busy GPU costs the same either way.  =0 keeps the blocking sync.
+    bool spin = true;
     uint8_t* d_q8 = nullptr;
     float* d_scales = nullptr;
     void* d_scratch = nullptr;
