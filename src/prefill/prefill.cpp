@@ -2172,20 +2172,46 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
 // (that stage idles until this one hands its rows over).  False when it cannot help this prompt.
 bool Prefill::bind_stage_helper(int64_t T) {
     Impl& m = *impl_;
-    if (!m.help_pp || helper_ == nullptr || m.pp) return false;
+    // Why a prompt did not get the idle stage, said each time: the helper is opt-in, and "on but every prompt was
+    // refused" and "off" look identical from outside - which is what hid this for so long under STRATA_PREFILL_HELP=1.
+    auto no = [&](const std::string& why) {
+        std::fprintf(stderr, "strata prefill: the idle stage does not help this %lld-token prompt: %s\n",
+                     (long long) T, why.c_str());
+        return false;
+    };
+    if (!m.help_pp || helper_ == nullptr) return no("STRATA_PREFILL_HELP armed no helper for this stage");
+    if (m.pp) return no("a peer is already active");
     const double frac = split_help_frac(T);
-    if (frac <= 0.0 || T < split_help_min() || m.src == nullptr || m.ring <= 8 || fused_ring()) return false;
+    if (frac <= 0.0) return no("the share is 0 at this chunk size (split_help_frac)");
+    if (T < split_help_min()) return no("the chunk is below the helper's floor (" + std::to_string(split_help_min()) + " tokens)");
+    if (m.src == nullptr) return no("this stage has no expert source");
+    if (m.ring <= 8) return no("this stage's ring is " + std::to_string(m.ring) + " slots (<= 8)");
+    if (fused_ring()) return no("the fused prompt kernels are in use");
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     for (int64_t l = stage_lb_; l < stage_le_; ++l) {
-        if (!(mmq_plan().any && mmq_plan().layer[(size_t) l])) return false;   // the peer computes on MMQ only
-        if (lay.native && fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type)) return false;
+        if (!(mmq_plan().any && mmq_plan().layer[(size_t) l]))   // the peer computes on MMQ only
+            return no("layer " + std::to_string((long long) l) + " is not on the MMQ prompt path");
+        if (lay.native && fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type))
+            return no("layer " + std::to_string((long long) l) + " runs the fused native kernels");
     }
     Impl& h = *helper_->impl_;
     // the helper's buffers must be laid out for this chunk (the serve path lends every stage's at once)
-    if (h.T < T || h.mixed == nullptr || h.Hq == nullptr || h.GU == nullptr || h.H == nullptr ||
-        h.Dm == nullptr || h.src_dev == nullptr || h.ids_identity == nullptr || h.bounds_dev == nullptr ||
-        h.grp_gu == nullptr || h.grp_d == nullptr || !h.mmq_ctx || h.ring <= 8)
-        return false;
+    if (h.T < T)
+        return no("the helper's buffers are for " + std::to_string((long long) h.T) + " tokens, this chunk is " +
+                  std::to_string((long long) T));
+    if (h.mixed == nullptr || h.Hq == nullptr || h.GU == nullptr || h.H == nullptr || h.Dm == nullptr ||
+        h.src_dev == nullptr || h.ids_identity == nullptr || h.bounds_dev == nullptr || h.grp_gu == nullptr ||
+        h.grp_d == nullptr || !h.mmq_ctx)
+        return no("the helper's prompt buffers are not all laid out");
+    if (h.ring <= 8) return no("the helper's ring is " + std::to_string(h.ring) + " slots (<= 8)");
+    // Binds from here on: say so once, so "the helper ran" and "every prompt was refused" cannot be confused - the
+    // engine exits on a CUDA fault before any timing line, which is how this was misread once already.
+    static bool said_bound = false;
+    if (!said_bound) {
+        said_bound = true;
+        std::fprintf(stderr, "strata prefill: the idle stage (CUDA%d) helps this %lld-token prompt, share %.2f of its "
+                             "streamed experts\n", h.device, (long long) T, frac);
+    }
     PeerPrefill& P = *m.help_pp;
     P.T_max = T;
     P.cap_rows = T * K;
@@ -2199,9 +2225,19 @@ bool Prefill::bind_stage_helper(int64_t T) {
         // the helper uses at most T rows, so its quantized inputs fit after those GU rows.
         const size_t xq_bytes = mmq::q8_bytes(T, N);
         const size_t hq_bytes = mmq::q8_bytes(T, 640);
-        if (K < 2 || xq_bytes + hq_bytes > (size_t) T * (K - 1) * 1280 * sizeof(float)) return false;
+        if (K < 2 || xq_bytes + hq_bytes > (size_t) T * (K - 1) * 1280 * sizeof(float))
+            return no("the helper's GU has no room for the peer's quantized inputs");
         P.Xq_g = reinterpret_cast<uint8_t*>(h.GU + (size_t) T * 1280);
         P.Hq_g = static_cast<uint8_t*>(P.Xq_g) + xq_bytes;
+        // ...and H.  With no H buffer of its own this stage hands the peer `xn16`, which holds T*(D+pad)
+        // uint16 = (D+pad)/2 floats a token, while the peer writes up to cap_rows*640 floats there (its
+        // swiglu and quantize run per MMQ group, over the group's rows).  A pack whose K*640 exceeds
+        // (D+pad)/2 would write past the buffer, so refuse it here: V100 + IQ3_S needs 6,400 floats a token
+        // against 1,312, which is what made STRATA_PREFILL_HELP=1 die with an illegal memory access.
+        const size_t h_floats = (size_t) T * (D + (hc_pad() ? XN_PAD : 0)) / 2;
+        if ((size_t) P.cap_rows * 640 > h_floats)
+            return no("the helper's H holds " + std::to_string(h_floats) + " floats, the peer writes " +
+                      std::to_string((size_t) P.cap_rows * 640) + " (K*640 a token)");
     }
     P.GU_g = h.GU;
     P.H_g = h.H;
