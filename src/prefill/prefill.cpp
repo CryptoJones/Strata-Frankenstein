@@ -2832,7 +2832,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     // ms_ple and ms_experts_host are cumulative since setup (Prefill::reset), so this run's own share is printed
     // as a delta below; printed raw they read as a per-request cost and grow with every request the engine serves
+    // experts_streamed/streamed_bytes are cumulative the same way, and are the bytes this run moved over PCIe
     const double ple0 = stats_.ms_ple, host0 = stats_.ms_experts_host;
+    const int64_t blobs0 = stats_.experts_streamed, bytes0 = stats_.streamed_bytes;
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
@@ -3250,6 +3252,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.stager->issued_one(en.job, m.copy);
                     }
                     ++stats_.experts_streamed;   // only an actual transfer is counted
+                    stats_.streamed_bytes += (int64_t) bytes;
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
                 m.stage_live[sl] = true;
@@ -3268,7 +3271,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
-        int64_t iss_streamed = 0, iss_dma = 0;
+        int64_t iss_streamed = 0, iss_dma = 0, iss_bytes = 0;
         std::thread issuer;
         struct IssuerJoin {
             std::atomic<bool>* stop;
@@ -3307,6 +3310,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.stager->issued_one(en.job, m.copy);
                         }
                         ++iss_streamed;   // only an actual transfer is counted
+                        iss_bytes += (int64_t) bytes;
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
                     m.stage_live[sl] = true;
@@ -4822,6 +4826,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
+                            stats_.streamed_bytes += (int64_t) lay.blob_bytes(l);
                             return true;
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
@@ -5428,6 +5433,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
+            stats_.streamed_bytes += iss_bytes;
         }
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
@@ -5605,9 +5611,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             line += b;
         }
         std::fprintf(stderr, "strata prefill timing: CUDA%d layers [%lld,%lld), %lld tokens, GPU timeline %.0f ms, "
-                             "wall %.0f ms, host staging %.0f ms, cumulative CPU experts %lld (share %.2f):%s\n",
+                             "wall %.0f ms, host staging %.0f ms, %lld blobs streamed (%.2f GiB over PCIe), "
+                             "cumulative CPU experts %lld (share %.2f):%s\n",
                      m.device, (long long) stage_lb_, (long long) (stage_le_ < 0 ? m.g->n_layers : stage_le_),
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host - host0,
+                     (long long) (stats_.experts_streamed - blobs0),
+                     (double) (stats_.streamed_bytes - bytes0) / (1024.0 * 1024.0 * 1024.0),
                      (long long) stats_.experts_cpu, stats_.cpu_share, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
