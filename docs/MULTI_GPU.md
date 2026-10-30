@@ -214,10 +214,12 @@ same as measuring it off. `STRATA_PREFILL_HELP_MIN=N` gives the helper its own f
 setting `STRATA_PREFILL_HELP` turns the promotion off (the engine says so at start), so measure the two apart.
 
 Native packs on the MMQ prompt path only (not with the fused prompt kernels, `STRATA_PF_FUSED=1`, nor with
-`--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share. On this fork's two V100s the helper was
-measured with its window forced open and the engine faults with `prefill: the PLE rows' upload failed: an illegal
-memory access was encountered`, so it stays off there; the earlier "no meaningful prefill gain" note was read on a
-window `STRATA_PREFILL_STREAM_MIN=6144` had already emptied.
+`--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share. Setting `STRATA_PREFILL_HELP=1` at all is
+not usable on this fork's two V100s: the engine faults with `prefill: the PLE rows' upload failed: an illegal memory
+access was encountered`, reproduced twice. The sticky error surfaces at the PLE upload and the helper's own
+`peer GPU` line never prints, so the helper never arms - the fault is in the setup beside it, not in its compute.
+`STRATA_PREFILL_PROMOTE=0` alone, the other thing `STRATA_PREFILL_HELP` does, ran the same workload clean. The
+earlier "no meaningful prefill gain" note was read on a window `STRATA_PREFILL_STREAM_MIN=6144` had already emptied.
 
 The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D1[,D2..]` (the later stages'
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
