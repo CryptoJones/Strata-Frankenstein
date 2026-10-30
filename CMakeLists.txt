@@ -69,6 +69,13 @@ if(STRATA_HIP_GFX906)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
+# Frankenstein: the expert SwiGLU's exp as IEEE-rounded operations (src/kernels/cuda/portable_expf.cuh) instead of the
+# hardware __expf, so a HIP helper worker returns the CUDA helpers' bytes.  Build the CUDA engine and the HIP worker
+# with the same setting.  Changes the expert kernels' rounding (within 1 ulp of exp; __expf is ~2).
+option(STRATA_PORTABLE_EXPF "Expert SwiGLU exp identical on CUDA and HIP (portable_expf.cuh)" OFF)
+if(STRATA_PORTABLE_EXPF)
+  add_compile_definitions(STRATA_PORTABLE_EXPF=1)
+endif()
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
@@ -1792,4 +1799,34 @@ if(TARGET strata_engine)
     add_test(NAME helper_abi_test COMMAND helper_abi_test)
     set_tests_properties(helper_abi_test PROPERTIES TIMEOUT 120)
   endif()
+endif()
+
+# Frankenstein: the helper workers against each other on real expert blobs (tests/helper/hip_worker_parity.cpp).
+# The driver dlopens the CPU reference, the HIP worker (from a HIP configure of this tree) and, on a CUDA build, the
+# CUDA worker: src/helpers/hip_helper.cu compiled with nvcc - the CUDA helper's grouped expert kernels behind the
+# same C ABI, so a HIP result can be compared with the CUDA kernels' own bytes in one process.  Manual: it needs the
+# blobs and the cards (see the file's header); not an add_test.
+add_executable(hip_worker_parity tests/helper/hip_worker_parity.cpp)
+target_include_directories(hip_worker_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(hip_worker_parity PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+add_dependencies(hip_worker_parity strata_helper_cpu_reference)
+if(TARGET ggml-base)   # --oracle: ggml's own dequantization for an FP32 reference
+  target_compile_definitions(hip_worker_parity PRIVATE STRATA_PARITY_GGML=1)
+  target_link_libraries(hip_worker_parity PRIVATE ggml-base)
+endif()
+option(STRATA_HELPER_CUDA_WORKER "Build libstrata_helper_cuda_worker.so (compiles strata_kernels position-independent)" OFF)
+if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND TARGET strata_kernels)
+  target_compile_definitions(hip_worker_parity PRIVATE STRATA_PARITY_CUDART=1)
+  target_link_libraries(hip_worker_parity PRIVATE CUDA::cudart)
+endif()
+if(STRATA_HELPER_CUDA_WORKER AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND TARGET strata_kernels)
+  # a shared library cannot take the engine's non-PIC kernels archive: this option makes it PIC for the whole build
+  set_target_properties(strata_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  add_library(strata_helper_cuda_worker SHARED src/helpers/hip_helper.cu)
+  target_include_directories(strata_helper_cuda_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_helper_cuda_worker PRIVATE strata_kernels CUDA::cudart)
+  set_target_properties(strata_helper_cuda_worker PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden
+                        VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON OUTPUT_NAME "strata_helper_cuda_worker")
+  target_link_options(strata_helper_cuda_worker PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic)
+  add_dependencies(hip_worker_parity strata_helper_cuda_worker)
 endif()

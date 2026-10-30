@@ -23,6 +23,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "portable_expf.cuh"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -169,7 +171,7 @@ __global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
     if (i >= n_pairs) return;
     const float g = gate_up[i];
     const float u = gate_up[n_pairs + i];
-    gate_up[i] = (g / (1.0f + __expf(-g))) * u;
+    gate_up[i] = (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * u;
 }
 
 __global__ void swiglu_quantize_q8_0_scaled_kernel(float* __restrict__ gate_up, long long n_pairs,
@@ -181,7 +183,7 @@ __global__ void swiglu_quantize_q8_0_scaled_kernel(float* __restrict__ gate_up, 
     const long long idx = b * 32 + lane;
     const float g = gate_up[idx];
     const float u = gate_up[n_pairs + idx];
-    const float xv = (g / (1.0f + __expf(-g))) * u;
+    const float xv = (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * u;
     gate_up[idx] = xv;
     uint8_t* out = blocks + b * 34;
 

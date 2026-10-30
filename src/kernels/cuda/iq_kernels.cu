@@ -8,6 +8,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
+#include "portable_expf.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1333,7 +1334,7 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    h[i] = (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * up[i];
 }
 
 template<int TD>
@@ -1663,9 +1664,9 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i];
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * up[i];
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + STRATA_SWIGLU_EXPF(-g)), up[i]);
 #endif
         q8_1_store(h, hq, i);
     }
@@ -2427,7 +2428,7 @@ __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const flo
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps only
     const float g = gate[i];
-    const float xi = (g / (1.0f + __expf(-g))) * up[i];
+    const float xi = (g / (1.0f + STRATA_SWIGLU_EXPF(-g))) * up[i];
     h[i] = xi;
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -3518,7 +3519,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
             const float gg = res[warp][lane], uu = res[warp][32 + lane];
-            const float xi = (gg / (1.0f + __expf(-gg))) * uu;
+            const float xi = (gg / (1.0f + STRATA_SWIGLU_EXPF(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {

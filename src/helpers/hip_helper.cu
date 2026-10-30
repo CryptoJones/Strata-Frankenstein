@@ -21,7 +21,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -91,6 +93,11 @@ struct strata_helper_device {
     int32_t n_entries = 0;
     bool pending = false;
     std::vector<uint8_t> staging;        // verify read-back
+    // STRATA_HELPER_TIMING=1: per-launch phase times on stderr (events around the copies and the kernels)
+    bool timing = false;
+    cudaEvent_t ev[4] = {};
+    double stage_us = 0.0;
+    int32_t timed_tok = 0;
 };
 
 namespace {
@@ -145,6 +152,7 @@ void release(strata_helper_device* d) {
         if (d->h_x) cudaFreeHost(d->h_x);
         if (d->h_out) cudaFreeHost(d->h_out);
         if (d->h_meta) cudaFreeHost(d->h_meta);
+        for (cudaEvent_t& e : d->ev) if (e) cudaEventDestroy(e);
         if (d->stream) cudaStreamDestroy(d->stream);
     }
     delete d;
@@ -194,6 +202,11 @@ int w_open(int device, const strata_helper_open_params* p, strata_helper_device*
         check(cudaMalloc(&d->d_scratch, scratch), "scratch", err, cap) &&
         check(cudaMalloc(&d->d_meta, d->meta_bytes), "group metadata", err, cap);
     if (!ok) return 1;
+    if (const char* t = std::getenv("STRATA_HELPER_TIMING"); t && t[0] == '1') {
+        d->timing = true;
+        for (cudaEvent_t& e : d->ev)
+            if (!check(cudaEventCreate(&e), "timing event", err, cap)) return 1;
+    }
     meta_layout((int64_t) CAP, d->dm, (uint8_t*) d->d_meta);
     meta_layout((int64_t) CAP, d->hm, (uint8_t*) d->h_meta);
     *out = d.release();
@@ -241,38 +254,64 @@ int w_begin(strata_helper_device* d, const strata_helper_launch* L, char* err, s
     d->pending = false;
     if (L->n_entries == 0) { d->pending = true; return 0; }
     const size_t H = (size_t) d->n_embd;
+    const auto t_stage = std::chrono::steady_clock::now();
     std::memcpy(d->h_x, L->x, (size_t) L->n_tok * H * sizeof(float));
+    // The S2 grouped kernels keep at most GMAX = 8 entries of a group and drop the rest without a word
+    // (s2_expert_grouped.cu); the engine never sends more (a verify window is <= 8 tokens), but a longer window
+    // must not come back with stale rows, so an S2 group is cut into runs of 8 here, the same slot repeated.
+    // Each entry's arithmetic does not depend on its run, so the rows are those of the 8-token windows.
+    constexpr int32_t kS2GroupMax = 8;
+    int32_t n_groups = 0;
+    if (L->start[0] != 0 || L->start[L->n_groups] != L->n_entries)
+        return fail(err, cap, std::string(kBackend) + " worker: the groups do not cover the launch's entries");
     for (int32_t g = 0; g < L->n_groups; ++g) {
         const int32_t slot = L->slot[g];
         if (slot < 0 || (size_t) slot >= d->slot_bytes.size()) return fail(err, cap, std::string(kBackend) + " worker: a launch names a slot that does not exist");
-        d->hm.ptr[g] = (unsigned long long) (d->arena + d->slot_off[(size_t) slot]);
+        if (L->start[g + 1] < L->start[g]) return fail(err, cap, std::string(kBackend) + " worker: group starts out of order");
+        const unsigned long long ptr = (unsigned long long) (d->arena + d->slot_off[(size_t) slot]);
+        const int32_t run = d->native ? std::max<int32_t>(1, L->start[g + 1] - L->start[g]) : kS2GroupMax;
+        for (int32_t at = L->start[g]; at < L->start[g + 1] || at == L->start[g]; at += run) {
+            if (n_groups >= d->cap) return fail(err, cap, std::string(kBackend) + " worker: more groups than the opened entries");
+            d->hm.ptr[n_groups] = ptr;
+            d->hm.start[n_groups] = at;
+            ++n_groups;
+            if (at + run >= L->start[g + 1]) break;
+        }
     }
-    std::memcpy(d->hm.start, L->start, (size_t) (L->n_groups + 1) * sizeof(int32_t));
+    d->hm.start[n_groups] = L->n_entries;
     for (int32_t i = 0; i < L->n_entries; ++i) {
         if (L->tok[i] < 0 || L->tok[i] >= L->n_tok) return fail(err, cap, std::string(kBackend) + " worker: a launch entry names a token outside the window");
         d->hm.dst[i] = i;   // packed output rows, in entry order
         d->hm.tok[i] = L->tok[i];
     }
-    *d->hm.count = L->n_groups;
+    *d->hm.count = n_groups;
     DeviceScope scope(d->device);
     if (!scope.ok) return fail(err, cap, std::string(kBackend) + " worker: device switch failed");
     const cudaStream_t s = d->stream;
+    if (d->timing) {
+        d->stage_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_stage).count();
+        d->timed_tok = (int32_t) L->n_tok;
+        cudaEventRecord(d->ev[0], s);
+    }
     if (!check(cudaMemcpyAsync(d->d_x, d->h_x, (size_t) L->n_tok * H * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, cap) ||
         !check(cudaMemcpyAsync(d->d_meta, d->h_meta, d->meta_bytes, cudaMemcpyHostToDevice, s), "copy group metadata", err, cap))
         return 1;
+    if (d->timing) cudaEventRecord(d->ev[1], s);
     if (d->native) {
         strata::kernels::quantize_q8_1_rows(d->d_x, L->n_tok, (int64_t) H, d->d_q8, s);
         auto lay = strata::kernels::native_expert_layout(L->gu_type, L->d_type, d->n_embd, d->n_ff);
         strata::kernels::native_expert_grouped(lay, d->dm.ptr, d->dm.start, d->dm.count, d->dm.dst, d->dm.tok,
-                                               L->n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scratch, d->d_out, s);
+                                               n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scratch, d->d_out, s);
     } else {
         strata::kernels::quantize_q8_0_scaled(d->d_x, d->d_q8, d->d_scales, L->n_tok * (int64_t) H, s);
         strata::kernels::moe_grouped_s2(d->dm.ptr, d->dm.start, d->dm.count, d->dm.dst, d->dm.tok,
-                                        L->n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scales, d->d_scratch, d->d_out, s);
+                                        n_groups, (int64_t) L->n_entries, d->d_q8, d->d_scales, d->d_scratch, d->d_out, s);
     }
     if (!check(cudaGetLastError(), "expert kernels", err, cap)) return 1;
+    if (d->timing) cudaEventRecord(d->ev[2], s);
     if (!check(cudaMemcpyAsync(d->h_out, d->d_out, (size_t) L->n_entries * H * sizeof(float), cudaMemcpyDeviceToHost, s), "copy results", err, cap))
         return 1;
+    if (d->timing) cudaEventRecord(d->ev[3], s);
     d->pending = true;
     return 0;
 }
@@ -285,6 +324,12 @@ int w_finish(strata_helper_device* d, const float** rows, char* err, size_t cap)
         DeviceScope scope(d->device);
         if (!scope.ok) return fail(err, cap, std::string(kBackend) + " worker: device switch failed");
         if (!check(cudaStreamSynchronize(d->stream), "finish", err, cap)) return 1;
+        if (d->timing) {
+            float ms[3] = {};
+            for (int i = 0; i < 3; ++i) cudaEventElapsedTime(&ms[i], d->ev[i], d->ev[i + 1]);
+            std::fprintf(stderr, "helper-timing backend=%s n_tok=%d entries=%d stage_us=%.1f h2d_us=%.1f kernel_us=%.1f d2h_us=%.1f\n",
+                         kBackend, (int) d->timed_tok, (int) d->n_entries, d->stage_us, 1e3 * ms[0], 1e3 * ms[1], 1e3 * ms[2]);
+        }
     }
     *rows = d->h_out;
     return 0;
