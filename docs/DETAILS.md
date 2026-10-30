@@ -1530,6 +1530,19 @@ print(r.choices[0].message.content)
   second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
   1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
   92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
+  This also repairs consecutive `<tool_call>` openers before a complete function call inside the thinking.
+  The call must name a declared tool, start on its own line outside code, and be followed only by whitespace
+  or more calls up to `</think>` or a natural stop. A quoted call or one cut by a token limit, cancellation,
+  or error stays text. Parameter values are not rewritten.
+- **Generation safeguard counters.** With `"api_monitor": true`, open `/api-monitor` to see calls recovered from
+  thinking, duplicate openers repaired, candidate calls kept as thinking, passage-loop stops, repeated-token stops,
+  and reasoning retries. The same counters are in `/metrics` under `totals`: `tool_calls_from_reasoning`,
+  `tool_call_openers_repaired`, `tool_calls_kept_as_reasoning`, `reasoning_loop_stops`, `repeated_token_stops`,
+  and `reasoning_recoveries`. Counts reset when the server starts. Categories overlap: a repaired opener also
+  counts as a recovered call. Calls kept as thinking counts recognized candidates rejected at settlement,
+  not every tag in quoted code. These are intervention counts, not a measured model error rate.
+  For request-level passage-loop stopping, set `"reasoning_loop_recovery": "stop"`; it ends that reply as
+  `"length"` and leaves the server available for the next request. This switch remains off by default.
 - **opencode's environment block in the user turn (opt-in).** opencode writes an `<env>` block (working directory,
   today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that
   are the same in every session. The prefix cache only reuses a prompt's start, so every new folder and every new day
