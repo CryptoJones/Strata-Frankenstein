@@ -1,12 +1,27 @@
 # StraylightSprawl™
 
-**One mixture-of-experts inference engine spread across mismatched GPUs.** StraylightSprawl is a fork of [Strata-V100](https://github.com/jmnargi/Strata-V100) (itself a fork of [Strata](https://github.com/Niko1221/Strata)) that lets AMD cards (ROCm/HIP) serve MoE experts as helpers next to the NVIDIA (CUDA) cards that run the engine.
+**One mixture-of-experts inference engine, sprawled across mismatched GPUs.**
 
-- **Expert helper ABI** (`strata_helper_api_v1`): a vendor-neutral C interface, with workers loaded at run time via `dlopen`.
-- **HIP helper worker** (`libstrata_helper_hip.so`): grouped native and S2 expert kernels on an AMD card. Its output is byte-identical to the CUDA expert kernels when built with `-DSTRATA_PORTABLE_EXPF=ON` (validated on a Radeon Pro V620).
-- **CPU reference worker**, `--helper-shadow` identity mode, and `tests/helper/hip_worker_parity.cpp` for checking parity, timing and CUDA+ROCm coexistence.
+## What it is
 
-The binary and CMake project are still named `strata`; everything below is the upstream Strata-V100 README.
+StraylightSprawl runs one large mixture-of-experts (MoE) model across GPUs from different vendors in the same machine. The NVIDIA (CUDA) cards run the engine: attention, the dense layers, the KV cache and the most-used experts. Other cards, such as an AMD Radeon (ROCm/HIP), join in as **expert helpers**. Each helper holds part of the model's experts in its own memory and computes them when a token routes there. More of the model stays in fast GPU memory instead of system RAM, and that's what sets generation speed for a model too big for one card.
+
+It's built on [Strata](https://github.com/Niko1221/Strata) by way of [Strata-V100](https://github.com/jmnargi/Strata-V100), and targets Qwen3.8-Flash-Next. What this fork adds:
+
+- **Expert helper ABI** (`strata_helper_api_v1`): a small, vendor-neutral C interface. The engine loads helper workers at run time with `dlopen`, so it never links another vendor's runtime directly.
+- **HIP helper worker** (`libstrata_helper_hip.so`): the grouped native and S2 expert kernels, compiled for AMD. With `-DSTRATA_PORTABLE_EXPF=ON` its output is byte-identical to the CUDA expert kernels (validated on a Radeon Pro V620). The CUDA and ROCm runtimes coexist in one process.
+- **CPU reference worker**, plus a `--helper-shadow` identity mode and `tests/helper/hip_worker_parity.cpp` for checking parity, timing and coexistence.
+
+The binary and CMake project are still named `strata`.
+
+## Where the name comes from
+
+Both halves come from William Gibson's *Neuromancer* (1984):
+
+- **The Sprawl** is Gibson's endless megacity, the Boston–Atlanta Metropolitan Axis: one continuous organism built out of mismatched parts. That's the engine here, spread across hardware that was never designed to work together.
+- **Straylight** is Villa Straylight, the Tessier-Ashpool family's home in orbit. It's where the book's two halves of a mind, the AIs Wintermute and Neuromancer, finally merge into one. That's what the helper ABI does with an NVIDIA engine and an AMD helper.
+
+The project began life as *Strata-Frankenstein*, a monster stitched together from parts of different makers. It got a better name.
 
 ---
 
