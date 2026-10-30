@@ -15,6 +15,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/portable_expf.cuh"   // STRATA_SWIGLU_EXPF: the exp the S2 expert SwiGLU takes (portable with STRATA_PORTABLE_EXPF)
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
@@ -71,10 +72,13 @@ __global__ void swilu_legacy_kernel(const float* g, const float* u, float* out, 
     const double x = (double) g[i];
     out[i] = (float) (x / (1.0 + exp(-x))) * u[i];
 }
+// (the S2 expert path's expression, `s2_expert_grouped.cu`'s swiglu_kernel: its exp is STRATA_SWIGLU_EXPF, the portable
+// one under STRATA_PORTABLE_EXPF, so this reference follows the same macro - a hard-coded __expf here would compare the
+// fused kernel against an expression the engine no longer runs)
 __global__ void swilu_fast_kernel(const float* g, const float* u, float* out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    out[i] = (g[i] / (1.0f + __expf(-g[i]))) * u[i];
+    out[i] = (g[i] / (1.0f + STRATA_SWIGLU_EXPF(-g[i]))) * u[i];
 }
 __global__ void swilu_native_kernel(const float* g, const float* u, float* out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
