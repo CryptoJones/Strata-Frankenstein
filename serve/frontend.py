@@ -909,6 +909,7 @@ class OutputParser:
         # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
         self.pending: list[list] = []
         self.rescued = 0             # calls delivered from the reasoning
+        self.repaired_openers = 0   # delivered reasoning calls whose duplicated wrapper was removed
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
         # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
@@ -1049,6 +1050,8 @@ class OutputParser:
             if call is not None and deliver:
                 out.append(Event("tool_call", call=call))
                 self.rescued += 1
+                if re.match(r"<tool_call>\s*<tool_call>", raw):
+                    self.repaired_openers += 1
             elif call is None or not deliver:
                 if call is not None:
                     self.refused += 1
@@ -1209,13 +1212,18 @@ class OutputParser:
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
                 body = self.buf[len(CALL_START):]
-                end, think = call_end(body), body.find(THINK_END)
+                # Only discard consecutive wrapper openers before the function, never markup in an argument.
+                duplicate = re.match(r"(?:\s*<tool_call>)+\s*(?=<function=)", body) if self.recover else None
+                skip = duplicate.end() if duplicate else 0
+                end, think = call_end(body[skip:]), body.find(THINK_END)
+                if end >= 0:
+                    end += skip
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
-                        name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
+                        name = body[skip:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         if name in self.schemas:
-                            call = parse_tool_call(body[:end], self.schemas.get(name))
+                            call = parse_tool_call(body[skip:end], self.schemas.get(name))
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]

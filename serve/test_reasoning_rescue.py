@@ -172,6 +172,45 @@ class Gates(unittest.TestCase):
         p.finish("stop")
         self.assertEqual((p.rescued, p.refused), (1, 0))
 
+    def test_duplicate_openers_preserve_arguments_and_safety_gates(self):
+        for width in WIDTHS:
+            for count in (1, 2, 4):
+                raw = ("<tool_call>\n" * count) + CALL
+                for prefix, suffix, finish, recover, tools, want in (
+                    ("Now.\n", "", "stop", True, SCHEMA, 1),
+                    ("Now.\n", "\n</think>\nDone", "stop", True, SCHEMA, 1),
+                    ("Now.\n", "", "length", True, SCHEMA, 0),
+                    ("Now.\n", "", "cancel", True, SCHEMA, 0),
+                    ("Now.\n", "", "error", True, SCHEMA, 0),
+                    ("Now.\n", "", "disconnect", True, SCHEMA, 0),
+                    ("Example:\n```\n", "\n```", "stop", True, SCHEMA, 0),
+                    ("Use `\n", "", "stop", True, SCHEMA, 0),
+                    ("Now.\n", "\nbut first check", "stop", True, SCHEMA, 0),
+                    ("Now.\n", "", "stop", False, SCHEMA, 0),
+                    ("Now.\n", "", "stop", True, [], 0),
+                ):
+                    with self.subTest(width=width, count=count, prefix=prefix, finish=finish, recover=recover):
+                        p = OutputParser(thinking=True, tools=tools, recover=recover)
+                        text = prefix + raw + suffix
+                        events = []
+                        for i in range(0, len(text), width or 5):
+                            events += p.feed(text[i:i + (width or 5)])
+                        events += p.finish(finish)
+                        found = [e.call for e in events if e.kind == "tool_call"]
+                        self.assertEqual([(c.name, c.arguments) for c in found],
+                                         [("write", {"path": "file.txt"})] if want else [])
+                        self.assertEqual(p.repaired_openers, want)
+                        if not want:
+                            self.assertEqual(reasoning(events), text)
+
+    def test_duplicate_wrapper_does_not_change_literal_markup_in_argument(self):
+        value = "literal <tool_call> and </tool_call> remain"
+        raw = "<tool_call>\n" + CALL.replace("file.txt", value)
+        for cut in range(1, len(raw)):
+            p = OutputParser(thinking=True, tools=SCHEMA, recover=True)
+            events = p.feed(raw[:cut]) + p.feed(raw[cut:]) + p.finish("stop")
+            self.assertEqual([e.call.arguments for e in events if e.kind == "tool_call"], [{"path": value}])
+
 
 class VisibleAnswer(unittest.TestCase):
     """#1058: the same fence / inline-code rule for a call in the visible answer (after </think>)."""
@@ -216,6 +255,7 @@ class OverHttp(unittest.TestCase):
     def ask(self, script, max_tokens=800):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.tool_call_recovery = True
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "save my notes"}]
@@ -262,6 +302,9 @@ class OverHttp(unittest.TestCase):
     def test_a_stranded_call_is_a_call_in_every_api(self):
         a = self.ask("Writing the file now.\n\n" + CALL)
         self.assertEqual(set(a.values()), {1}, a)
+
+    def test_duplicate_opener_is_a_call_in_every_api(self):
+        self.assertEqual(set(self.ask("Writing now.\n<tool_call>\n" + CALL).values()), {1})
 
     def test_quotes_and_cuts_are_not(self):
         for name, script, tokens in (
