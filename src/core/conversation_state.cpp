@@ -11,13 +11,6 @@ namespace {
 using conversation_detail::add;
 using conversation_detail::product;
 
-std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
-    return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
-            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
-            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
-            g.hc, g.hc_lr, g.n_expert, g.n_ff};
-}
-
 bool fail(std::string& error, const char* message) {
     error = std::string("conversation snapshot: ") + message;
     return false;
@@ -30,10 +23,10 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
+bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool queued = false) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
+    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -78,11 +71,14 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
         std::any_of(view.ids.begin(), view.ids.end(), [](int32_t id) { return id < 0; }))
         return fail(error, "invalid live token/image metadata");
+    if (view.live_state && (view.live_state->ids != view.ids || view.live_state->imgs != view.images ||
+        !conversation_checkpoint_validate(*view.live_state, ss, g, error)))
+        return fail(error, "invalid saved live checkpoint");
     for (const auto& c : view.checkpoints) {
         if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
             !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
             return fail(error, "checkpoint is not a live token prefix");
-        if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+        if (c.has_state() && !conversation_checkpoint_validate(c, ss, g, error)) return false;
         size_t image = 0;
         for (const auto& key : view.images) {
             if ((uint64_t) key.start >= c.ids.size()) break;
@@ -94,11 +90,14 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     return true;
 }
 
+// The private bytes one checkpoint copy adds: its ids and images.  Its five
+// running-state payloads are shared by the copy (ConversationPayload), so they
+// add no physical RAM and are charged only where a payload is captured fresh.
 bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
+    for (size_t n : {ids, images})
         if (!add(total, n)) return false;
     return true;
 }
@@ -106,7 +105,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
 
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z, std::string& error) {
     z = {};
-    const auto key = geometry_key(g);
+    const auto key = conversation_geometry_key(g);
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] < 0 || (i != 1 && key[i] == 0)) return fail(error, "invalid model geometry");
     size_t recurrence = 0, convolution = 0;
@@ -152,26 +151,54 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     return true;
 }
 
+#if defined(STRATA_GPU_METAL)
+}  // namespace strata::core
+namespace strata::metal_engine {
+// the running state lives in the Metal decode window (metal/src/engine/window.cpp), not in the session's buffers
+bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& error);
+bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& error);
+}  // namespace strata::metal_engine
+namespace strata::core {
+#endif
+
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
                                   const ModelGeometry& g, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    (void) ss; (void) g;
+    return strata::metal_engine::window_checkpoint_save(c, error);
+#endif
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    // writable_all(): every byte below is overwritten by the device copy, so a payload still shared with an
+    // archived copy or a slot is detached with a fresh block instead of copying ~118 MB that is about to go.
+    uint8_t* const gdn = c.gdn.writable_all();
+    uint8_t* const ple = c.ple.writable_all();
+    uint8_t* const tails = c.tails.writable_all();
+    uint8_t* const dead = c.dead.writable_all();
+    uint8_t* const block_pos = c.block_pos.writable_all();
+    if (!copy(gdn, ss.gdn_state, c.gdn.size(), error) ||
+        !copy(ple, ss.ple_hist, c.ple.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(tails + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(dead + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(block_pos + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     return true;
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    (void) g;
+    if (!strata::metal_engine::window_checkpoint_restore(c, error)) return false;
+    ss.ple_prev[0] = c.ids.size() >= 2 ? c.ids[c.ids.size() - 2] : -1;
+    ss.ple_prev[1] = c.ids.size() >= 1 ? c.ids[c.ids.size() - 1] : -1;
+    return true;
+#endif
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
@@ -194,6 +221,37 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     return sync(error);
 }
 
+bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
+                                  const ModelGeometry& g, std::string& error, bool queued) {
+    // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
+    // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
+    // the same places, through copy() like the restore (the private non-blocking stream, complete on return unless
+    // `queued`: then the caller synchronizes the device).
+    ConversationStateSizes zf, zt;
+    if (!checkpoint_targets(from, g, ids.size(), zf, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
+        return false;
+    if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
+        owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
+        return fail(error, "direct copy between differently carved sessions");
+    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, queued); };
+    if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
+        !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
+    for (size_t j = 0; j < owned_qsa(from); ++j) {
+        const auto& a = owned(from, j);
+        const auto& b = owned(to, j);
+        if (!acopy(b.idx_tail, a.idx_tail, zf.tail) || !acopy(b.idx_dead, a.idx_dead, zf.dead) ||
+            !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
+        if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
+            const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+        }
+    }
+    const size_t tokens = ids.size();
+    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
+    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
+    return true;
+}
+
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
     bytes = 0;
@@ -208,8 +266,13 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(layers, {qsa + (draft ? 1 : 0), sizeof(ConversationKv)}) ||
         !product(tails, {qsa, z.tail}) || !product(dead, {qsa, z.dead}) ||
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
-    for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
+    for (size_t n : {ids, images, checkpoints, layers})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    // The live checkpoint is captured fresh only without a live_state; with one it
+    // is a copy that shares its payloads, so those bytes are already held.
+    if (!view.live_state)
+        for (size_t n : {tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
+            if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
@@ -236,7 +299,13 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
         if (!conversation_kv_validate(reuse.kv[i], st, g, reuse.captured_tokens, index, error)) return false;
         const size_t fresh = conversation_kv_bytes(st, g, int64_t(view.ids.size()), index);
         size_t retained = 0;
-        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained, error)) return false;
+        // The draft ring's final cell is refreshed on the next compute, so its save
+        // rewrites from one token earlier - conversation_snapshot_save passes it
+        // max(unchanged - 1, 0) - and its detach covers that longer tail.
+        const int64_t unchanged = index ? reuse.unchanged_tokens
+                                        : std::max<int64_t>(0, reuse.unchanged_tokens - 1);
+        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained,
+                                           error, unchanged)) return false;
         bytes -= fresh;
         if (!add(bytes, retained)) return fail(error, "retained K/V allocation overflow");
     }
@@ -253,16 +322,20 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
+    // A capture never carries the caller's previous provenance: terminal_from
+    // starts unknown and the caller records the input boundary it just read.
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.terminal_from = 0;
+    captured.geometry = conversation_geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
-    captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    if (view.live_state) captured.live = *view.live_state;
+    else { captured.live.ids = view.ids; captured.live.imgs = view.images; }
+    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    if (!view.live_state && !conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
@@ -280,10 +353,10 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const QsaState& draft, std::string& error) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.geometry = conversation_geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
@@ -312,7 +385,7 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     l.max_tokens = tokens;
     l.max_checkpoints = max_checkpoints;
     l.max_kv_layers = layers + 1;
-    l.geometry = geometry_key(g);
+    l.geometry = conversation_geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
     l.max_kv_bytes.assign(layers + 1, {});
@@ -331,7 +404,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
-    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (image.geometry != conversation_geometry_key(g)) return fail(error, "incompatible runtime geometry");
     // an image holds exactly one carve's running state and K/V: same layer range or nothing
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
@@ -389,7 +462,7 @@ bool conversation_stage_save(SavedConversation& image, const ConversationView& v
     size_t estimate = 0;
     if (!conversation_stage_bytes(view, ss, g, estimate, error) || !sync(error)) return false;
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.terminal_from = 0;   // a fresh capture: the caller records its input boundary
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
@@ -406,7 +479,7 @@ bool conversation_stage_save(SavedConversation& image, const ConversationView& v
 bool conversation_stage_validate(const SavedConversation& image, const SessionState& ss,
                                  const ModelGeometry& g, std::string& error) {
     if (!image.live.stage_parts.empty()) return fail(error, "layer-split parking is not supported");
-    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (image.geometry != conversation_geometry_key(g)) return fail(error, "incompatible runtime geometry");
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
@@ -476,7 +549,7 @@ bool conversation_disk_delta_save(SavedConversation& out, const ConversationView
         return fail(error, "invalid delta base");
     if (!sync(error)) return false;
     out = {};
-    out.geometry = geometry_key(g);
+    out.geometry = conversation_geometry_key(g);
     out.layer_lo = ss.layer_lo;
     out.layer_hi = ss.layer_hi;
     out.cvec = view.cvec;
@@ -486,7 +559,7 @@ bool conversation_disk_delta_save(SavedConversation& out, const ConversationView
     for (const auto& key : view.images)
         if (key.start >= first_token) out.live.imgs.push_back(key);
     for (const auto& c : view.checkpoints)
-        if ((int64_t) c.ids.size() > first_token) out.checkpoints.push_back(c);
+        if (c.pinned || (int64_t) c.ids.size() > first_token) out.checkpoints.push_back(c);
     const size_t layers = owned_qsa(ss);
     out.kv.resize(layers + (draft ? 1 : 0));
     if (!conversation_checkpoint_save(out.live, ss, g, error)) return false;
@@ -525,5 +598,32 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
     return conversation_snapshot_restore(image, ss, g, &draft, error);
+}
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& ss, const ModelGeometry& g,
+                                                          const QsaState& draft, std::string& error) {
+    return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error);
+}
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& ss, const ModelGeometry& g,
+                                                          const QsaState* draft, std::string& error) {
+    // a layer split's image (stage images) is restored stage by stage, never in part
+    if (!image.stage_images.empty()) {
+        fail(error, "a layer split's image restored as a single session");
+        return ConversationRestore::invalid;
+    }
+    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    const int64_t captured = (int64_t) image.live.ids.size();
+    if (upto < 1 || upto > captured) {
+        fail(error, "the borrowed prefix is not inside the parked conversation");
+        return ConversationRestore::invalid;
+    }
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error))
+            return ConversationRestore::transfer_failed;
+    if (draft && !conversation_kv_restore_prefix(image.kv.back(), *draft, g, captured, upto, false, error))
+        return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
 }
 } // namespace strata::core

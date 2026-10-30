@@ -23,9 +23,11 @@
 #endif
 #include <atomic>
 #include <cerrno>
+#if !defined(_WIN32)   // the io_uring path below is POSIX-only; the Windows path is above
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#endif
 
 namespace strata::platform {
 
@@ -335,7 +337,12 @@ DirectFile::~DirectFile() { close(); delete impl_; }
 
 bool DirectFile::open(const std::string& path, std::string& err) {
     close();
+#if defined(__APPLE__)   // macOS has no O_DIRECT: F_NOCACHE keeps the reads out of the unified buffer cache
+    impl_->fd = ::open(path.c_str(), O_RDONLY);
+    if (impl_->fd >= 0 && fcntl(impl_->fd, F_NOCACHE, 1) != 0) { ::close(impl_->fd); impl_->fd = -1; }
+#else
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+#endif
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
