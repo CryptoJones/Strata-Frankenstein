@@ -25,7 +25,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "portable_expf.cuh"
+#include "strata/kernels/portable_expf.cuh"
 
 #include <atomic>
 #include <cstdint>

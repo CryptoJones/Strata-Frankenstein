@@ -10,7 +10,7 @@ It's built on [Strata](https://github.com/Niko1221/Strata) by way of [Strata-V10
 
 - **Expert helper ABI** (`strata_helper_api_v1`): a small, vendor-neutral C interface. The engine loads helper workers at run time with `dlopen`, so it never links another vendor's runtime directly.
 - **HIP helper worker** (`libstrata_helper_hip.so`): the grouped native and S2 expert kernels, compiled for AMD. With `-DSTRATA_PORTABLE_EXPF=ON` its output is byte-identical to the CUDA expert kernels (validated on a Radeon Pro V620). The CUDA and ROCm runtimes coexist in one process.
-- **CPU reference worker**, plus a `--helper-shadow` identity mode and `tests/helper/hip_worker_parity.cpp` for checking parity, timing and coexistence.
+- **CPU reference worker**, plus a `--helper-shadow` identity mode and `tests/helper/hip_worker_parity.cpp` for checking parity, timing and coexistence. (Shadow mode compares against a run without the worker; run that one with `STRATA_ROUTE_TAIL_SKIP=0`, because any helper tier turns the route tail skip off.)
 
 The binary and CMake project are still named `strata`.
 

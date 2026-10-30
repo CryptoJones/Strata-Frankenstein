@@ -11,7 +11,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
-#include "portable_expf.cuh"
+#include "strata/kernels/portable_expf.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -2712,9 +2712,9 @@ __global__ void __launch_bounds__(512) native_gu_swiglu_kernel(const unsigned lo
                 if (c < n && t == c) {
                     const float gg = gv[c] * sg, uu = uv[c] * su;
 #if defined(__HIPCC__)
-                    sh[c][sw] = (gg / (1.0f + __expf(-gg))) * uu;
+                    sh[c][sw] = (gg / (1.0f + STRATA_SWIGLU_EXPF(-gg))) * uu;
 #else
-                    sh[c][sw] = __fmul_rn(gg / (1.0f + __expf(-gg)), uu);
+                    sh[c][sw] = __fmul_rn(gg / (1.0f + STRATA_SWIGLU_EXPF(-gg)), uu);
 #endif
                 }
             }

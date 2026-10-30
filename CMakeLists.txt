@@ -7,7 +7,7 @@
 # CUDA builds require compute capability 7.0 or newer.  Optional kernels with newer ISA requirements are
 # selected below so a binary never contains instructions its target GPU cannot execute.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 1.1.0 LANGUAGES CXX)
+project(strata VERSION 1.1.1 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -69,7 +69,7 @@ if(STRATA_HIP_GFX906)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
-# Frankenstein: the expert SwiGLU's exp as IEEE-rounded operations (src/kernels/cuda/portable_expf.cuh) instead of the
+# Frankenstein: the expert SwiGLU's exp as IEEE-rounded operations (include/strata/kernels/portable_expf.cuh) instead of the
 # hardware __expf, so a HIP helper worker returns the CUDA helpers' bytes.  Build the CUDA engine and the HIP worker
 # with the same setting.  Changes the expert kernels' rounding (within 1 ulp of exp; __expf is ~2).
 option(STRATA_PORTABLE_EXPF "Expert SwiGLU exp identical on CUDA and HIP (portable_expf.cuh)" OFF)

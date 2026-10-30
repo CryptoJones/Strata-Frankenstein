@@ -1,4 +1,4 @@
-// src/kernels/cuda/portable_expf.cuh - an exp(x) that rounds the same on NVIDIA and AMD.
+// include/strata/kernels/portable_expf.cuh - an exp(x) that rounds the same on NVIDIA and AMD.
 //
 // WHY.  `__expf` is the hardware approximation: ex2.approx on NVIDIA, v_exp_f32 on AMD.  Both are within ~2 ulp of
 // exp, but not of each other: over 2^24 inputs in [-16, 16] an RTX 4060 and a Radeon Pro V620 (gfx1030) disagree

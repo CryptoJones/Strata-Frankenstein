@@ -91,7 +91,10 @@ public:
     /// rows that are left to the CPU and that the worker holds.
     bool holds(int64_t layer, int32_t expert) const override { return !shadow_ && table_.slot_of(layer, expert) >= 0; }
     /// --helper-shadow: take only rows the CPU pool would have computed.  With a worker that computes as the pool
-    /// does (the CPU reference worker), a run must then be byte-identical to the same run without the worker.
+    /// does (the CPU reference worker), a run must then be byte-identical to the same run without the worker -
+    /// provided both runs route the same rows: any helper tier turns the route tail skip off
+    /// (expert_source.cpp, `tail_rank > 0 && d.remote_count == 0`), so the run without the worker needs
+    /// STRATA_ROUTE_TAIL_SKIP=0 (the serve default is rank 7) for the comparison to hold.
     void set_shadow(bool on) { shadow_ = on; }
     bool shadow() const { return shadow_; }
     bool finish(float* out, std::string& err) override;
