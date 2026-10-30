@@ -3,13 +3,17 @@
 // A helper worker library (strata/helper/strata_helper_abi.h) whose "device" is host memory and whose compute is
 // the engine's own CPU expert kernels, one entry at a time.  It exists so the engine side of a foreign helper -
 // the loader, the slot table, the grouping, the row return - can be run and compared on a machine with no second
-// GPU at all: with this worker enabled, every token must be BIT-IDENTICAL to a run without it, because the rows
-// it computes are the rows the CPU pool would otherwise have computed with the same functions.  Slow by design
+// GPU at all: with this worker enabled under --helper-shadow, every token must be BIT-IDENTICAL to a run without
+// it, because the rows it computes are the rows the CPU pool would otherwise have computed with the same functions.
+// (Without --helper-shadow the worker is a helper like CUDA1: it is striped with the CUDA helpers' experts and its
+// experts leave the GPU plan's PCIe share, so the run legitimately computes other experts on other devices.)  Slow by design
 // (no threads, no overlap): a correctness instrument, not a tier anyone should serve from.
 #include "strata/helper/strata_helper_abi.h"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -49,6 +53,9 @@ struct strata_helper_device {
     std::vector<uint8_t> act, hq;        // max_tokens * kNativeActBytes / kNativeHBytes
     std::vector<float> ff;               // max_tokens * n_ff
     std::vector<uint8_t> act_done;       // per token of this launch: activation already quantized
+    // a native Q2_0 layer (q2_native_kernels): the pool's Q2_0 activations instead of the packed native ones
+    std::vector<ActQ> act_q2, h_q2;      // max_tokens each
+    std::vector<float> gbuf, ubuf;       // max_tokens * n_ff, the Q2_0 gate and up rows before SwiGLU
     // S2 scratch
     ActQ act_q{};
     ExpertScratch ws{};
@@ -93,6 +100,10 @@ int w_open(int device, const strata_helper_open_params* p, strata_helper_device*
     dev->hq.assign((size_t) p->max_tokens * kNativeHBytes, 0);
     dev->ff.assign((size_t) p->max_tokens * (size_t) p->n_ff, 0.0f);
     dev->act_done.assign((size_t) p->max_tokens, 0);
+    dev->act_q2.resize((size_t) p->max_tokens);
+    dev->h_q2.resize((size_t) p->max_tokens);
+    dev->gbuf.assign((size_t) p->max_tokens * (size_t) p->n_ff, 0.0f);
+    dev->ubuf.assign((size_t) p->max_tokens * (size_t) p->n_ff, 0.0f);
     *out = dev.release();
     return 0;
 }
@@ -124,27 +135,55 @@ int w_read_slot(strata_helper_device* dev, int32_t slot, uint8_t* dst, int64_t b
 }
 
 // One expert for the `nt` tokens routed to it, native pack: the pool's row functions over every row, composed as
-// run_split_multi_native composes them for one ExpertJobMulti - gate/up rows for all the tokens, each token's
-// intermediate quantized, down rows for all the tokens.  Bitwise the pool's result for the same (expert, tokens).
+// run_split_multi_native composes them for one ExpertJobMulti (pool.cpp, phases 5 and 6) - gate/up rows for all the
+// tokens, each token's intermediate quantized, down rows for all the tokens.  A Q2_0 layer on an AVX-2 CPU takes the
+// pool's Q2_0 branch (q2_native_kernels): act_quant_any activations, q2_rows_any rows, SwiGLU after.  Bitwise the
+// pool's result for the same (expert, tokens): every kernel here computes a row independently of the row range the
+// pool's tasks split it into.
 void native_group(strata_helper_device& d, const uint8_t* blob, const int32_t* toks, int nt, float* const* out_rows) {
-    const void* acts[MAXT]; float* ffs[MAXT]; const void* hqs[MAXT];
+    const NativeFmt& f = d.fmt;
+    const bool q2_gu = q2_native_kernels(f.gu_type), q2_d = q2_native_kernels(f.d_type);
+    const void* acts[MAXT]; const ActQ* acts_q2[MAXT]; float* ffs[MAXT];
     for (int t = 0; t < nt; ++t) {
         const int32_t tok = toks[t];
         uint8_t* a = d.act.data() + (size_t) tok * kNativeActBytes;
         if (!d.act_done[(size_t) tok]) {
-            native_quant_act(d.fmt, d.x.data() + (size_t) tok * d.n_embd, a);
+            if (q2_gu) act_quant_any(d.x.data() + (size_t) tok * d.n_embd, (int) d.n_embd, d.act_q2[(size_t) tok]);
+            else native_quant_act(f, d.x.data() + (size_t) tok * d.n_embd, a);
             d.act_done[(size_t) tok] = 1;
         }
         acts[t] = a;
+        acts_q2[t] = &d.act_q2[(size_t) tok];
         ffs[t] = d.ff.data() + (size_t) t * d.n_ff;
     }
-    native_gu_rows(d.fmt, blob, acts, nt, ffs, 0, (int) d.n_ff);
-    for (int t = 0; t < nt; ++t) {
-        uint8_t* h = d.hq.data() + (size_t) t * kNativeHBytes;
-        native_quant_h(d.fmt, ffs[t], h);
-        hqs[t] = h;
+    if (q2_gu) {
+        float* gp[MAXT]; float* up[MAXT];
+        for (int t = 0; t < nt; ++t) {
+            gp[t] = d.gbuf.data() + (size_t) t * d.n_ff;
+            up[t] = d.ubuf.data() + (size_t) t * d.n_ff;
+        }
+        const int nbk = (int) (f.n_embd / 64);
+        q2_rows_any(blob, f.gu_row, nbk, acts_q2, nt, gp, 0, (int) d.n_ff);
+        q2_rows_any(blob + f.up_off, f.gu_row, nbk, acts_q2, nt, up, 0, (int) d.n_ff);
+        for (int t = 0; t < nt; ++t)
+            for (int r = 0; r < (int) d.n_ff; ++r)
+                ffs[t][r] = (gp[t][r] / (1.f + std::exp(-gp[t][r]))) * up[t][r];
+    } else {
+        native_gu_rows(f, blob, acts, nt, ffs, 0, (int) d.n_ff);
     }
-    native_down_rows(d.fmt, blob, hqs, nt, out_rows, 0, (int) d.n_embd);
+    if (q2_d) {
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < nt; ++t) { act_quant_any(ffs[t], (int) d.n_ff, d.h_q2[(size_t) t]); a2[t] = &d.h_q2[(size_t) t]; }
+        q2_rows_any(blob + f.down_off, f.d_row, (int) (f.n_ff / 64), a2, nt, out_rows, 0, (int) d.n_embd);
+    } else {
+        const void* hqs[MAXT];
+        for (int t = 0; t < nt; ++t) {
+            uint8_t* h = d.hq.data() + (size_t) t * kNativeHBytes;
+            native_quant_h(f, ffs[t], h);
+            hqs[t] = h;
+        }
+        native_down_rows(f, blob, hqs, nt, out_rows, 0, (int) d.n_embd);
+    }
 }
 
 int w_begin(strata_helper_device* dev, const strata_helper_launch* L, char* err, size_t cap) {

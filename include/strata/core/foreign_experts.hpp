@@ -86,7 +86,14 @@ public:
     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
                const int32_t* primary_res, std::string& err) override;
     bool owns(int64_t index) const override { return owned_[(size_t) index] != 0; }
-    bool holds(int64_t layer, int32_t expert) const override { return table_.slot_of(layer, expert) >= 0; }
+    /// In shadow mode (set_shadow) the worker's experts steer nothing: the GPU plan counts them as CPU misses (the
+    /// PCIe share and the plan are the run's without the worker), so this answers false; begin() still claims the
+    /// rows that are left to the CPU and that the worker holds.
+    bool holds(int64_t layer, int32_t expert) const override { return !shadow_ && table_.slot_of(layer, expert) >= 0; }
+    /// --helper-shadow: take only rows the CPU pool would have computed.  With a worker that computes as the pool
+    /// does (the CPU reference worker), a run must then be byte-identical to the same run without the worker.
+    void set_shadow(bool on) { shadow_ = on; }
+    bool shadow() const { return shadow_; }
     bool finish(float* out, std::string& err) override;
     int64_t resident() const override { return table_.resident(); }
     int64_t computed() const override { return computed_; }
@@ -110,6 +117,7 @@ private:
     std::string label_;
     HelperSlotTable table_;
     bool native_ = false;
+    bool shadow_ = false;
     int64_t computed_ = 0, launched_layers_ = 0;
     uint64_t returned_bytes_ = 0, full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;

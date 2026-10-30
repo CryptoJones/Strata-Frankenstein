@@ -503,6 +503,10 @@ struct Options {
     int helper_device = 0;              ///< the worker's own device ordinal
     int expert_cache_helper = 0;        ///< slots on it (auto = as many as fit)
     bool expert_cache_helper_auto = false;
+    /// --helper-shadow: the worker takes only what the CPU pool would compute - its experts are the ranked ones left
+    /// after CUDA1..3 are filled and they do not steer the GPU plan's PCIe share.  The identity gate's mode: with the
+    /// CPU reference worker a run must be byte-identical to the same run without the worker.
+    bool helper_shadow = false;
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     bool expert_cache_cpu_order = false;
@@ -930,6 +934,8 @@ void usage() {
                  "                       one more expert tier on its own device, e.g. a HIP build for an AMD card\n"
                  "  --helper-device N      the worker's device ordinal (default 0)\n"
                  "  --expert-cache-helper N|auto  fill the worker's device with N experts or as many as fit\n"
+                 "  --helper-shadow        the worker takes only rows the CPU pool would compute (experts after\n"
+                 "                       CUDA1..3's, no say in the PCIe plan): byte-identity checks of a worker\n"
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
@@ -2179,6 +2185,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--helper-worker") o.helper_worker = next("--helper-worker");
+        else if (a == "--helper-shadow") o.helper_shadow = true;
         else if (a == "--helper-device") o.helper_device = std::atoi(next("--helper-device"));
         else if (a == "--expert-cache-helper") {
             const std::string v = next("--expert-cache-helper");
@@ -5860,10 +5867,11 @@ int main(int argc, char** argv) {
     // the helper buckets in order: CUDA1..3, then the foreign worker's device
     const std::array<int, 4> bucket_cap{o.expert_cache_remote[0], o.expert_cache_remote[1], o.expert_cache_remote[2],
                                         foreign_helper ? o.expert_cache_helper : 0};
+    // --helper-shadow: the worker's device is no stripe bucket; it takes the ranked pairs CUDA1..3 left over (below)
     std::vector<int> buckets;
-    for (int b = 0; b < 4; ++b) if (bucket_cap[(size_t) b] > 0) buckets.push_back(b);
+    for (int b = 0; b < 4; ++b) if (bucket_cap[(size_t) b] > 0 && !(b == 3 && o.helper_shadow)) buckets.push_back(b);
     const bool multi_remote = buckets.size() > 1;
-    if (!buckets.empty()) {
+    if (!buckets.empty() || foreign_helper) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
             std::fprintf(stderr, "strata generate: remote experts need --expert-profile, "
                                  "a CUDA0 expert cache and the expert pool\n");
@@ -5893,7 +5901,10 @@ int main(int argc, char** argv) {
                                  "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 4> by_device;
-        if (multi_remote) {
+        if (foreign_helper && o.helper_shadow) by_device[3] = ranked;   // open() skips what CUDA1..3 claimed
+        if (buckets.empty()) {
+            // only the shadow worker: it takes the ranked list itself
+        } else if (multi_remote) {
             // Either stripe experts for parallel GPU work, or give each layer one
             // secondary GPU to reduce switches and transfers over shared USB4.
             std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
@@ -5949,14 +5960,16 @@ int main(int argc, char** argv) {
         }
         if (foreign_helper) {
             foreign = std::make_unique<strata::core::ForeignExperts>();
+            foreign->set_shadow(o.helper_shadow);
             if (!foreign->open(helper_lib, o.helper_device, helper_label, o.expert_cache_helper, g.n_layers, g.n_expert,
                                by_device[3], xcache, *srcp, claimed, err, o.expert_cache_helper_auto)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
             std::fprintf(stderr, "strata generate: %s: %lld additional experts, %.2f GiB on the worker's device; "
-                                 "results return through its host rows\n", helper_label.c_str(),
-                         (long long) foreign->resident(), foreign->gib());
+                                 "results return through its host rows%s\n", helper_label.c_str(),
+                         (long long) foreign->resident(), foreign->gib(),
+                         o.helper_shadow ? " (shadow: CPU rows only, after CUDA1..3's experts)" : "");
         }
     }
 
