@@ -127,6 +127,13 @@ async function showDetail() {
 async function refresh() {
   try {
     const [status, history, metrics] = await Promise.all([api("/v1/status"), api("/api/requests"), api("/metrics")]);
+    const totals = metrics.totals || {};
+    for (const [id, key] of Object.entries({
+      "rescued-calls": "tool_calls_from_reasoning", "repaired-openers": "tool_call_openers_repaired",
+      "refused-calls": "tool_calls_kept_as_reasoning",
+      "loop-stops": "reasoning_loop_stops", "token-stops": "repeated_token_stops",
+      "reasoning-retries": "reasoning_recoveries"
+    })) text(id, totals[key] ?? 0);
     state = status; records = history.requests;
     status.loaded = history.loaded; status.auto_load = history.auto_load;
     if (selected && !records.some(r => r.id === selected)) {

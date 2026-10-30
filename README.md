@@ -38,11 +38,22 @@ Strata is an open-source local runtime for [Qwen3.8-Flash-Next](https://huggingf
 ## What this fork focuses on
 
 - **Tesla V100 / Volta support (`sm_70`)**: preserve normal V100 builds and runtime support. V100 builds use a CUDA 12.x toolkit; CUDA 13 does not compile `sm_70` code.
-- **Test machine:** two Tesla V100-PCIE-16GB cards; one uses PCIe Gen3 x4 and the other Gen3 x16. The benchmark below uses only the x16 card. A system with both cards on full Gen3 x16 links could perform better, especially for multi-GPU workloads, but that configuration has not been measured here.
+- **Test machine:** two Tesla V100-PCIE-16GB cards; GPU 0 uses PCIe Gen3 x4 and GPU 1 uses Gen3 x16. The pipeline measurements below use both cards. The historical single-card benchmark uses only the x16 card. A system with two full Gen3 x16 links has not been measured here.
 - **Upstream integration**: this is not a separate replacement for Strata. Upstream changes are merged periodically, with V100 compatibility checked and corrected where needed. New upstream features may have hardware requirements above `sm_70`; they do not automatically accelerate V100.
 - **The wider Strata community**: improvements, bug reports, testing, documentation, and contributions for other supported platforms are welcome.
 
 Support for V100 does not imply that every upstream feature or every other GPU configuration has been tested on V100. Check the relevant code, release notes, and measurement reports before relying on a hardware-specific feature.
+
+## Selected upstream sync — 19 October 2026
+
+This branch imports shared CUDA engine and server changes from upstream
+commit `3d1fb480`. It keeps the fork's Volta kernels, pipeline K/V growth,
+and conversation-cache changes. It excludes unrelated desktop packages and
+separate Metal, AMD, and Intel backend updates. See the
+[sync scope](improvements/RELEASE-2026-10-19-V100.md).
+Use CUDA 12.8 with `sm_70`. An imported option does not establish a V100
+performance gain.
+
 
 ## Upstream v0.1.39 integration
 
@@ -77,6 +88,108 @@ values (engine SHA-256 `e9ad337a…`), reported in the
 Parallel slots at the 524,288-token context depend on the split and the memory left on the
 last stage; the measured fallback (requested 2, served one request at a time, configuration
 untouched) is described in [docs/BATCHING.md](docs/BATCHING.md).
+
+## Dual-V100 pipeline performance — 15 October 2026
+
+The measured service profile enables `--pipeline-windows 2` with GPU order
+`0,1` and layer split `16`. It uses two 16-GiB V100 cards at 175 W,
+a Ryzen 5 3600, the native IQ3_S mixed-format model, int8 KV, and MTP
+with `--spec 8`. The configured context capacity remains 524,288 tokens.
+The largest measured prompt is 32,768 tokens.
+
+**Long-response safety:** use a build with the
+[pipeline KV-growth repair](benchmarks/v100-pipeline-kv-growth-fix-2026-10-16.md)
+when combining this profile with `STRATA_KV_GROW=1`. The earlier pipeline
+loop could access unmapped KV cells during a long response. The repair
+drains speculative work before growing the mapping and then resumes
+pipelining. The short-output speed measurements below did not exercise
+that boundary.
+
+### Fresh-prompt prefill through 32K
+
+Each value is the median of three exact-token requests with no prompt reuse
+and a 16-token output cap. Prefill time excludes response generation.
+Throughput is prompt tokens divided by median prefill time.
+
+| Prompt tokens | Previous prefill time | Pipeline prefill time | Previous tokens/s | Pipeline tokens/s | Throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 2.089 s | 2.090 s | 980.6 | 979.8 | −0.09% |
+| 8,192 | 5.487 s | 5.494 s | 1,493.0 | 1,491.2 | −0.13% |
+| 16,384 | 8.828 s | 8.857 s | 1,855.9 | 1,849.8 | −0.33% |
+| 32,768 | 15.668 s | 15.677 s | 2,091.4 | 2,090.2 | −0.06% |
+
+Fresh-prompt prefill is approximately unchanged. These small differences
+do not establish a meaningful regression.
+
+### Conversation decode
+
+The separate HTTP comparison uses an 8,828-token initial prompt and six
+continuation turns. Context reaches approximately 11.9K tokens. Each value
+is the median of four requests, with arm order reversed on alternate rounds
+and a 256-token output cap. New prompt tokens are the tokens processed on
+that turn, not the total context size.
+
+| Turn | New prompt tokens | Previous decode tokens/s | Pipeline decode tokens/s | Decode change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 121 | 70.20 | 79.45 | +13.18% |
+| 2 | 321 | 70.60 | 82.05 | +16.22% |
+| 3 | 1,086 | 76.60 | 79.00 | +3.13% |
+| 4 | 128 | 73.00 | 79.90 | +9.45% |
+| 5 | 313 | 74.35 | 86.55 | +16.41% |
+| 6 | 1,089 | 74.15 | 80.75 | +8.90% |
+
+The median of the six decode throughput ratios is **+11.31%**.
+This is not a measured decode gain at every context size through 32K.
+Generated lengths and MTP work differ with automatic CPU sharing and
+resident routing. Whole-request latency is mixed; one short-turn HTTP
+median regresses. Do not interpret the decode gain as a guaranteed
+whole-request speedup or a matched-output comparison.
+
+A separate fixed-setting control matches all three complete 16-token output
+sequences at 2K, 8K, and 32K prompt sizes. It does not prove identical output
+for every production request.
+
+See the [evaluation report](benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
+for exact timings, build provenance, rejected trials, and reproduction
+commands. See the [service profile guide](docs/NVIDIA_V100.md#dual-pcie-pipeline-service-profile)
+before enabling the option on another installation.
+
+## TurboQuant KV cache — 25 October 2026
+
+TurboQuant is an opt-in KV cache format. It rotates each 256-value head with a Hadamard transform, then
+quantizes the rotated values against a Lloyd-Max codebook. Each head keeps one FP16 norm. The widths are
+3, 4, 6 and 8 bits per value. The fit is minimum squared error only; this cut has no QJL residual.
+
+Use `--kv tq6` (or `tq3`, `tq4`, `tq8`). The cache is resident only: it stays in VRAM, there is no host
+copy, and `--kv-resident` is refused. The MTP draft layer keeps its INT8 cache. Setup does not offer these
+values. Nothing is a default, and the daily service stays on int8.
+
+At the configured 524,288-token capacity, with the model's 12 attention layers, the KV cache is:
+
+| `--kv` | Bytes per cell, one layer | Full-capacity KV, 12 layers | Change from int8 |
+| --- | ---: | ---: | ---: |
+| int8 | 1,056 | 6.1875 GiB | — |
+| tq8 | 1,032 | 6.046875 GiB | −0.14 GiB |
+| tq6 | 776 | 4.546875 GiB | −1.64 GiB |
+| tq4 | 520 | 3.046875 GiB | −3.14 GiB |
+| tq3 | 392 | 2.296875 GiB | −3.89 GiB |
+
+The tq6 main saving is 1.64 GiB at full capacity. These are calculated capacities, not measured
+`nvidia-smi` reductions: the expert cache fills the freed VRAM, so total GPU memory stays near 15,600 MiB.
+
+The V100 prompt reader is a second opt-in: `STRATA_PROMPT_ATTN_TQ=1` on sm_70. It decodes compressed tiles
+for the prompt path; unset or `0` keeps the decode-attention fallback. It does not change the KV bytes.
+
+Measured on two Tesla V100 16 GB cards at 175 W with IQ3_S, `--spec 4`, `--layer-split 16`,
+`--pipeline-windows 2`, a cold 2,048-token output cap, and one run per size per arm. The tq6 arm had
+the prompt reader on. At 32,768 prompt tokens, tq6 prefilled at 1,687 tokens/s against int8's 2,117,
+and decoded at 120.2 tokens/s against 125.5. With the reader on, tq6's 51,746-token request wall time
+fell from 40.3–40.4 s to 31.7–31.9 s, still slower than int8's 25.8 s. These measurements do not show a
+speed gain. A needle test found 15 of 15 cells in both arms through 122,289 prompt tokens; that is not a
+general quality result.
+
+See the [full report](benchmarks/v100-turboquant-2026-10-25.md) and
+[details](docs/DETAILS.md#tesla-v100-fork-benchmark).
 
 ## V100 benchmark
 
@@ -162,32 +275,29 @@ The server normally listens on localhost. If you expose it to other machines, co
 
 ### Conversation cache disk (opt-in)
 
-The conversation state has three tiers. Tier 1 (L1) is the live session in GPU memory; it always exists. Tier 2 (L2) is the optional host-RAM cache (`--conversation-cache-mib`). Tier 3 (L3) is an optional disk store that keeps parked conversations in files across restarts.
+The conversation state has three tiers. L1 is the active session and its resident prompt checkpoints. L2 is the optional host-RAM cache (`--conversation-cache-mib`). L3 is an optional disk store that keeps saved conversations and checkpoint groups across restarts. Streamed KV layers use their authoritative host pools when the engine captures state.
 
 To use the disk store, add `--conversation-cache-disk strata-conversations --conversation-cache-disk-gib 25` to the engine arguments. The path and a positive GiB budget are required together. The store is off by default, it needs `--serve`, it works with `--conversation-cache-mib 0`, and it supports `--layer-split` on multiple GPUs. Optional: `--conversation-cache-disk-slots N` caps the record count, and `--conversation-cache-disk-min-free-mib N` keeps free space on the filesystem.
 
-Every conversation is an append-only CHAIN: one file, a fixed master header followed by one PANEL
-per park.  A park writes only the DELTA the conversation gained since its last park - the new
-token ids, new checkpoints, the current running state, and the new K/V pages (a full-snapshot
-store rewrote the whole conversation every turn; this one never does).  A chain may instead
-reference a shared system-prompt ('p') record as its BASE, in which case the system prompt's K/V
-is stored once and every chat's file holds only the chat's tail.  A record/panel is reused only
-when the prompt starts with exactly its tokens and images and its control-vector mode matches.
-The engine picks the longest valid prefix across the live session, the RAM cache, the disk
-chains and the idle batch slots, so a shorter disk record never displaces a longer resident
-state.  Panels are checksummed and versioned; the seed (first panel) writes through a temporary
-file and renames it into place, and appends write at the end of the chain and patch the master
-header.  A torn append (a crash mid-panel) is recovered on the next read by truncating back to
-the last complete panel, so the conversation survives to its previous park - strictly better
-than a full-snapshot store, where a crash mid-write lost the whole record.  Invalid files from
-older formats are removed at startup.  The store evicts the least recently used chain when it
-reaches its byte budget, its record cap, or the free-space floor; a referenced system-prompt
-base is pinned while any chat chain lives.  A corrupt or incompatible chain is removed, and the
-request falls back to normal prompt processing.
+The engine preserves an active checkpoint before retention removes it or a request overwrites its branch. Each saved checkpoint includes the GDN state, PLE history, QSA indexer state, and the required KV backing. Token KV data alone is not sufficient to resume this model.
 
-A shared system prompt gets its own small record. When a fresh chat is first read from token 0, the engine checkpoints the end of the system prompt (the first turn boundary; `--prompt-cache-root`, default 2048 tokens) and captures that prefix once into each enabled tier as a **system-prompt root image**. The root is pinned: the RAM cache and the disk LRU evict it only after every parked conversation, and an equal-length match prefers it because restoring it reads only the shared prefix (the 24k) instead of the longer conversation record that contains it (the 80k). `--conversation-cache-keep-root` and `--conversation-cache-disk-keep-root` (both default on) pin the root per tier; their `--no-` variants turn that tier's pin off. The capture runs only when the prefix is missing from a tier, so the shared bytes are written once, not once per chat.
+Related checkpoints share one KV image per archive group. The engine moves and extends that image instead of copying the full prefix for each checkpoint. It copies only new or changed KV pages when the backing is still valid. A group stops growing before it reaches the disk metadata limit. A later group has its own backing. The engine does not combine a saved checkpoint with KV bytes from a different computation of the prefix.
 
-The disk tier accelerates conversation alternation and server restarts. It does not itself add concurrent execution. Use `"parallel": 2` for parallel requests; see [batch slots](docs/BATCHING.md) for memory costs and limits. GPU capture must complete before the active session is overwritten, but the file write runs asynchronously while the next request uses the GPUs; a park with nothing new since the last panel writes NOTHING (zero I/O). Restore is synchronous. Save and restore stage the delta in host RAM, and the engine releases that memory after the file operation. A park appends only the delta (plus the model's fixed running state), so frequent switching no longer flattens the drive a full record at a time; one chain file per conversation grows in place. Size the GiB budget for the number of conversations you keep, not for one conversation's repeated full snapshots. See [details](docs/DETAILS.md) and [the benchmark report](benchmarks/v100-l3-conversation-cache-2026-10-03.md) for measured numbers.
+Archive groups use the same L2 byte and slot limits as saved conversations. L2 capacity victims move to L3 when the disk tier is enabled. A successful L2 admission does not also write the image to disk. If an image cannot fit in L2, the engine attempts to store it in L3. Physical-RAM and disk free-space limits still apply. The minimum-token setting also applies to checkpoint archives.
+
+Preserving a checkpoint is an optimization, not a requirement. If the host RAM floor or the disk budget refuses the image, the engine drops the checkpoint, logs the drop, and continues serving. It does not stop the server. The session stays correct; only the reuse of that checkpoint is lost.
+
+Lookup selects the longest compatible prefix across the active session, L2, L3, and idle batch slots. Tokens, image identity, and control-vector mode must match. For an edit to an earlier message, reuse ends at a saved checkpoint before the first changed token. The engine must process the suffix again; it cannot resume at an arbitrary matching token without the recurrent state at that position. Increasing `--prompt-cache` is not a substitute for checkpoint preservation.
+
+An L2 archive remains available after restore. A valid L3 image is promoted to L2 when the byte budget and physical-RAM floor permit it. Only a bounded subset of its checkpoints becomes resident in the active session. Restoring one branch does not remove other checkpoints from the saved archive.
+
+The disk store supports append-only conversation chains. A continuing chain can append new token IDs, checkpoints, running state, and KV pages. An L2 eviction writes a complete seed image; it does not require a GPU capture. A rewind starts a separate branch instead of replacing the source chain. The file format does not change for checkpoint archives.
+
+Disk panels have checksums and version fields. A seed uses a temporary file and a rename. An incomplete append is recovered to the last complete panel. Invalid or incompatible records are removed. The disk store evicts least-recently-used chains to enforce its byte budget, record limit, and free-space floor. Thus, neither L2 nor L3 provides unlimited history. If both tiers have evicted the required checkpoint, the request must process the missing prefix again.
+
+The engine captures a shared system-prompt root once into L2 when root retention is enabled. L3 receives the root on L2 eviction or failed L2 admission. With L2 disabled, an enabled L3 can receive the root directly. `--conversation-cache-keep-root` and `--conversation-cache-disk-keep-root` control root retention in each tier. Their `--no-` variants disable it. Roots have lower eviction priority than ordinary images; explicit request checkpoint pins remain protected.
+
+The disk tier does not add concurrent execution. See [batch slots](docs/BATCHING.md) for concurrent-request memory costs. Capture must finish before a request overwrites the required session bytes. Restore is synchronous. L2 eviction writes use host snapshots and can add disk I/O latency. Size both cache budgets for the conversations and checkpoint history that you need. See [the V100 guide](docs/NVIDIA_V100.md) for the checkpoint-retention verification and [the disk benchmark report](benchmarks/v100-l3-conversation-cache-2026-10-03.md) for earlier measurements.
 
 #### Measured V100 result
 

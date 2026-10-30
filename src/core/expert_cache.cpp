@@ -3,10 +3,12 @@
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
 #endif
 
+#include <thread>
+#include <mutex>
 #include <cuda_runtime.h>
 #if !defined(STRATA_EC_NO_VMM)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
@@ -574,8 +576,9 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
-        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it (and the
+        // STRATA_MMQ_DIRECT guard after each blob, 0 by default)
+        off[i + 1] = off[i] + (uint64_t) slot_stride(slot_bytes[i], guard_req_);
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
@@ -584,6 +587,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
+    guard_ = guard_req_;
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
@@ -608,6 +612,7 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
+    guard_ = 0;
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
@@ -663,6 +668,35 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
+}
+
+bool ExpertCache::promote_remap(int64_t layer, int32_t old_expert, int32_t cold_expert, int32_t hot_expert,
+                                int32_t old_slot, int32_t cold_slot, std::string& err) {
+    const auto bad = [&](const char* what) {
+        err = std::string("ExpertCache::promote_remap: ") + what;
+        return false;
+    };
+    if (layer < 0 || layer >= n_layers_ || old_expert < 0 || old_expert >= n_expert_ || cold_expert < 0 ||
+        cold_expert >= n_expert_ || hot_expert < 0 || hot_expert >= n_expert_)
+        return bad("an index is out of range");
+    if (old_slot < 0 || old_slot >= live_slots_ || cold_slot < 0 || cold_slot >= live_slots_ || old_slot == cold_slot)
+        return bad("the slots are out of range or the same");
+    const size_t base = (size_t) layer * (size_t) n_expert_;
+    if (residency_[base + (size_t) old_expert] != old_slot)
+        return bad("the old expert is not in its lent slot");
+    if (residency_[base + (size_t) cold_expert] != cold_slot)
+        return bad("the cold expert is not in the head slot");
+    if (residency_[base + (size_t) hot_expert] != kNotResident)
+        return bad("the hot expert is already resident");
+    for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
+        const int32_t slot = residency_[base + (size_t) e];
+        if (e != old_expert && slot == old_slot) return bad("another expert owns the lent slot");
+        if (e != cold_expert && slot == cold_slot) return bad("another expert owns the head slot");
+    }
+    residency_[base + (size_t) hot_expert] = cold_slot;
+    residency_[base + (size_t) cold_expert] = old_slot;
+    residency_[base + (size_t) old_expert] = kNotResident;
+    return true;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
@@ -741,6 +775,54 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr || parts == nullptr || n <= 0) {
+        err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
+        return false;
+    }
+    uint64_t total = 0;
+    for (int i = 0; i < n; ++i) total += parts[i].n;
+    if (total > (uint64_t) blob_) {
+        err = "ExpertCache::fill_slot_queued_parts: the pieces are larger than a slot";
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
+                                              (cudaStream_t) 0);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
+            return false;
+        }
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::copy_slot_queued(int32_t dst_slot, int32_t src_slot, int64_t bytes, std::string& err) {
+    uint8_t* dst = device_slot(dst_slot);
+    const uint8_t* src = device_slot(src_slot);
+    if (dst == nullptr || src == nullptr || dst_slot >= live_slots_ || src_slot >= live_slots_) {
+        err = "ExpertCache::copy_slot_queued: a slot is outside the arena";
+        return false;
+    }
+    if (bytes <= 0) {
+        err = "ExpertCache::copy_slot_queued: the copy size is not positive";
+        return false;
+    }
+    if ((uint64_t) bytes > slot_room(src_slot) || (uint64_t) bytes > slot_room(dst_slot)) {
+        err = "ExpertCache::copy_slot_queued: the copy does not fit the slots' room";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, src, (size_t) bytes, cudaMemcpyDeviceToDevice, (cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::copy_slot_queued: ") + cudaGetErrorString(e);
         return false;
     }
     ++fills_;

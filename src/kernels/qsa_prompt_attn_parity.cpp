@@ -13,6 +13,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -31,6 +32,15 @@ namespace {
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
 }
+
+// The dispatcher reads STRATA_PROMPT_ATTN_TQ per call; setting it must work on MSVC too (no setenv there).
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 template <typename T> T* up(const std::vector<T>& h) {
     T* d = nullptr;
     ck(cudaMalloc(&d, h.size() * sizeof(T) + 64), "malloc");
@@ -40,7 +50,7 @@ template <typename T> T* up(const std::vector<T>& h) {
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps, int tq_bits = 6) {   // fmt 1 int8, 0 fp16, 2 q4_0, 3 TurboQuant
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
     if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
         int dev = 0, major = 0;
@@ -51,6 +61,18 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                         (long long) ctx, major);
             return 0;
         }
+    }
+    if (fmt == 3) {   // the TurboQuant prompt kernel (mode 5, STRATA_PROMPT_ATTN_TQ=1) is sm_70 only
+        int dev = 0, major = 0, minor = 0;
+        ck(cudaGetDevice(&dev), "device");
+        ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cc");
+        ck(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev), "cc");
+        if (major != 7 || minor != 0) {
+            std::printf("SKIP tq%d ctx %lld: STRATA_PROMPT_ATTN_TQ's prompt kernel is sm_70 only (this device: "
+                        "sm_%d%d)\n", tq_bits, (long long) ctx, major, minor);
+            return 0;
+        }
+        set_env("STRATA_PROMPT_ATTN_TQ", "1");   // opt in: the dispatcher then refuses nothing and launches mode 5
     }
 #endif
     const k::QsaShapes s = k::qsa_real_shapes();
@@ -64,6 +86,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     std::vector<int8_t> kq, vq;
     std::vector<uint16_t> ks, vs, kh, vh;
     std::vector<uint8_t> k4, v4;   // q4_0: 8 blocks of {fp16 d, 16 code bytes} per row (kv_q4.hpp)
+    std::vector<uint8_t> kt, vt;   // TurboQuant: one TqBlock per row (kv_tq.hpp)
     constexpr int64_t B4 = 18, ROW4 = 8 * B4;
     if (fmt == 2) {
         std::uniform_int_distribution<int> byte(0, 255);
@@ -84,6 +107,20 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         for (auto& x : vq) x = (int8_t) code(rng);
         for (auto& x : ks) x = f2h(sc(rng));
         for (auto& x : vs) x = f2h(sc(rng));
+    } else if (fmt == 3) {
+        // Random index bytes through the documented group layout, and a positive FP16 norm per head in the range a
+        // rotated head's coordinates give (~1).  Both readers decode these same blocks, so the indices only have to
+        // exercise every width; the norm must stay off 0 (a zero block is legitimately all-zero on both sides).
+        const int64_t rowt = (int64_t) k::kv_tq_bytes_per_head(tq_bits, (int) HD);
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::uniform_real_distribution<float> nm(0.5f, 4.0f);
+        kt.resize((size_t) rows * rowt); vt.resize((size_t) rows * rowt);
+        for (auto* pool : {&kt, &vt})
+            for (int64_t b = 0; b < rows; ++b) {
+                const uint16_t nrm = f2h(nm(rng));
+                std::memcpy(pool->data() + b * rowt, &nrm, 2);
+                for (int64_t j = 2; j < rowt; ++j) (*pool)[(size_t) (b * rowt + j)] = (uint8_t) byte(rng);
+            }
     } else {
         kh.resize(rows * HD); vh.resize(rows * HD);
         for (auto& x : kh) x = f2h(nd(rng) * 1.5f);
@@ -182,7 +219,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
     k::QsaAttnPools pl;
-    if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
+    if (fmt == 3) { pl.k_tq = up(kt); pl.v_tq = up(vt); pl.tq_bits = tq_bits; }
+    else if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
@@ -209,16 +247,28 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
+    // int8 KV: v2 here, and the opt-in INT8-MMA kernel (STRATA_PROMPT_ATTN_IMMA) checked and timed below beside it
+    if (fmt == 1) k::qsa_prompt_attn_set_imma(0);
     auto new_run = [&]() {
         if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
             std::exit(2);
         }
     };
+    float* d_im = nullptr;
+    ck(cudaMalloc(&d_im, nq * NH * HD * 4), "malloc");
+    auto imma_run = [&]() {
+        k::qsa_prompt_attn_set_imma(1);
+        const bool ok = k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_im, nq, nullptr);
+        k::qsa_prompt_attn_set_imma(0);
+        if (!ok) { std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (imma)\n"); std::exit(2); }
+    };
     old_run();
     new_run();
+    if (fmt == 1) imma_run();
     ck(cudaDeviceSynchronize(), "run");
-    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size());
+    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size()), im(fmt == 1 ? o.size() : 0);
+    if (fmt == 1) ck(cudaMemcpy(im.data(), d_im, im.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down");
     {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
@@ -226,8 +276,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         for (float x : nw) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
         std::printf("NEWHASH %016llx\n", (unsigned long long) hh);
     }
-    // 1. FP64 reference on a sample of queries
-    double err_old = 0, err_new = 0, ref_scale = 0;
+    // 1. FP64 reference on a sample of queries (fmt 3 is checked against the decode reader below instead: this TU
+    //    carries no host copy of the codebook, and kv_tq_parity test [7] pins the same reader against the blocks)
+    double err_old = 0, err_new = 0, err_im = 0, ref_scale = 0;
+    if (fmt != 3) {
     for (int64_t i = 0; i < nq; i += std::max<int64_t>(1, nq / 16)) {
         const int64_t w = steps[i * k::kStepCount + k::kStepWidth];
         const int32_t* sel = ids.data() + i * cap;
@@ -261,9 +313,11 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
+                if (fmt == 1) err_im = std::max(err_im, std::fabs(im[at] - r));
             }
         }
     }
+    }   // fmt != 3: the TurboQuant arm has no FP64 reference in this TU
     // 2. new vs old everywhere
     double diff = 0, scale = 0;
     for (size_t i = 0; i < o.size(); ++i) {
@@ -285,17 +339,60 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = diff <= 1e-4 * scale;
-    std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
-                "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
-                err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
+    bool ok_im = true;
+    if (fmt == 1) {   // the INT8-MMA kernel: the same bounds as v2's, against FP64 and against v2
+        double d_iv = 0;
+        for (size_t i = 0; i < o.size(); ++i) d_iv = std::max(d_iv, (double) std::fabs(im[i] - nw[i]));
+        float ms_im = 0, ms_v2 = 0;
+        for (int round = 0; round < 2; ++round) {   // alternating, v2 then imma, twice; the second round counts
+            cudaEventRecord(e0);
+            for (int r = 0; r < reps; ++r) new_run();
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "time");
+            cudaEventElapsedTime(&ms_v2, e0, e1);
+            cudaEventRecord(e0);
+            for (int r = 0; r < reps; ++r) imma_run();
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "time");
+            cudaEventElapsedTime(&ms_im, e0, e1);
+        }
+        ok_im = err_im <= std::max(4.0 * err_old, 1e-6 * ref_scale) && d_iv <= 1e-4 * scale;
+        std::printf("%s int8 IMMA ctx %lld, %lld queries: vs FP64 %.3g (v2 %.3g, FP32 %.3g); IMMA vs v2 %.3g (%.2g of scale); "
+                    "v2 %.3f -> IMMA %.3f ms per chunk (%.2fx)\n", ok_im ? "PASS" : "FAIL", (long long) ctx, (long long) nq,
+                    err_im, err_new, err_old, d_iv, d_iv / scale, ms_v2 / reps, ms_im / reps, ms_v2 / ms_im);
+    }
+    k::qsa_prompt_attn_set_imma(-1);
+    cudaFree(d_im);
+    // fmt 3: no FP64 arm (see above).  Its contract is the TurboQuant decode reader on the SAME blocks, which is the
+    // bound kv_tq_parity test [7] applies too: the tensor path only decodes once into FP16 rows and moves the head
+    // norm into the FP32 scales, so FP16 centroid rounding is the expected difference.
+    const bool ok1 = fmt == 3 ? true : (err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale) && ok_im);
+    const bool ok2 = diff <= (fmt == 3 ? 5e-3 : 1e-4) * scale;
+    uint64_t sum = 1469598103934665603ull;   // the new kernel's output bits: two builds of it compare by this
+    for (float f : nw) {
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        sum = (sum ^ b) * 1099511628211ull;
+    }
+    const char* name = fmt == 3 ? (tq_bits == 3 ? "tq3" : tq_bits == 4 ? "tq4" : tq_bits == 6 ? "tq6" : "tq8")
+                     : fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16";
+    if (fmt == 3) {
+        std::printf("%s %s ctx %lld, %lld queries: mode 5 vs the TurboQuant decode reader %.3g (%.2g of scale); "
+                    "%.3f -> %.3f ms per chunk (%.2fx); new output checksum %016llx\n", ok2 ? "PASS" : "FAIL", name,
+                    (long long) ctx, (long long) nq, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
+                    (unsigned long long) sum);
+    } else {
+        std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g "
+                    "of scale); %.3f -> %.3f ms per chunk (%.2fx); new output checksum %016llx\n",
+                    ok1 && ok2 ? "PASS" : "FAIL", name, (long long) ctx, (long long) nq, err_old, err_new, ref_scale,
+                    diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new, (unsigned long long) sum);
+    }
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
     cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
     cudaFree((void*) pl.k_pool); cudaFree((void*) pl.v_pool); cudaFree((void*) pl.page_table);
     cudaFree((void*) pl.k_q4); cudaFree((void*) pl.v_q4);
+    cudaFree((void*) pl.k_tq); cudaFree((void*) pl.v_tq);
     return ok1 && ok2 ? 0 : 1;
 }
 }  // namespace
@@ -330,6 +427,13 @@ int main(int argc, char** argv) {
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
+#if !defined(__HIP_PLATFORM_AMD__)
+    // TurboQuant (STRATA_PROMPT_ATTN_TQ=1): all four widths, prompt-shaped selections; sm_70 only (the other devices
+    // print SKIP and return 0, so the same command is safe on a Turing card).
+    for (int bits : {3, 4, 6, 8}) fails += run(3, ctx, nq, reps, bits);
+    fails += run(3, 1500, std::min<int64_t>(nq, 1500), reps, 6);   // short context: the selection is every cell
+    fails += run(3, 2100, std::min<int64_t>(nq, 256), reps, 6);    // the identity-to-sparse edge
+#endif
     std::printf("FAILURES: %d\n", fails);
     return fails;
 }

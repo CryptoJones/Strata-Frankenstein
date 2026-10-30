@@ -1,0 +1,133 @@
+{
+ "hardware": {
+  "gpus": "2x Tesla V100-PCIE-16GB",
+  "power_limit_w": 175,
+  "pcie": "GPU0 Gen3 x4, GPU1 Gen3 x16",
+  "cpu": "Ryzen 5 3600 (6C/12T), 94 GiB RAM"
+ },
+ "configuration": {
+  "model": "Qwen3.8-Flash-Next IQ3_S",
+  "kv": "int8",
+  "context": 524288,
+  "layer_split": 16,
+  "spec": 4,
+  "spec_min_p": 0.7,
+  "pipeline_windows": 2,
+  "max_new": 256,
+  "reuse": 0,
+  "sampling": "the server default for this family: temperature 1.0, top_p 0.95, top_k 20",
+  "method": "the live strata-v100.service, restarted per arm with STRATA_VERIFY_ECAP set, bench/run_v100_bench.py --only 32K --seed 42 --max-tokens 256 --repeats 4"
+ },
+ "window_width": {
+  "daily_service_history": [
+   {
+    "request": "512 generated tokens, sampled",
+    "windows": 311,
+    "avg_T": 1.82,
+    "tokens_per_window": 1.65,
+    "ms_per_window": 23.42
+   },
+   {
+    "request": "512 generated tokens, sampled",
+    "windows": 300,
+    "avg_T": 1.84,
+    "tokens_per_window": 1.71,
+    "ms_per_window": 23.75
+   },
+   {
+    "request": "512 generated tokens, sampled",
+    "windows": 272,
+    "avg_T": 2.01,
+    "tokens_per_window": 1.88,
+    "ms_per_window": 25.54
+   }
+  ],
+  "rule": "the cap keeps token 0's K picks and the best N-K tail entries, so it drops nothing when the tail holds N-K entries or fewer. With K=10 and avg T 1.8-2.0 the tail holds 8-10 entries, and N=20 keeps 10: N=20 is inert at the daily window width."
+ },
+ "daily_workload": {
+  "decode_tok_s": {
+   "off": [
+    63.2,
+    72.4,
+    75.9,
+    74.3
+   ],
+   "n16": [
+    99.9,
+    79.9,
+    74.3,
+    64.5
+   ],
+   "off2": [
+    60.2,
+    63.6,
+    72.4,
+    68.8
+   ],
+   "n16b": [
+    67.7,
+    68.8,
+    65.7,
+    93.4
+   ]
+  },
+  "decode_mean": {
+   "off": 71.5,
+   "n16": 79.7,
+   "off2": 66.2,
+   "n16b": 73.9
+  },
+  "decode_median": {
+   "off": 73.35,
+   "n16": 77.1,
+   "off2": 66.2,
+   "n16b": 68.25
+  },
+  "prompt_ms": {
+   "off": [
+    14056.7,
+    14245.3,
+    14344.3,
+    14356.3
+   ],
+   "n16": [
+    14140.0,
+    14304.1,
+    14391.6,
+    14472.5
+   ],
+   "off2": [
+    14206.1,
+    14387.3,
+    14462.9,
+    14536.8
+   ],
+   "n16b": [
+    14232.5,
+    14385.7,
+    14464.2,
+    14491.3
+   ]
+  },
+  "drift_paired": [
+   {
+    "pair": "off -> n16",
+    "off_mean": 71.5,
+    "cap_mean": 79.7,
+    "change_pct": 11.5
+   },
+   {
+    "pair": "off2 -> n16b",
+    "off_mean": 66.2,
+    "cap_mean": 73.9,
+    "change_pct": 11.5
+   }
+  ]
+ },
+ "limits": [
+  "The daily-workload arms sample at temperature 1.0, so each arm generates different text and the per-request spread is 60 to 100 tok/s.",
+  "The two control arms drifted 8 % apart over the run, so the +11 % is read from drift-paired means, not from a pooled median (which moves +2.8 %).",
+  "The window report of the wide-window (greedy) arms is in benchmarks/v100-verify-ecap-2026-10-29.json.",
+  "No quality measurement: the option changes the output by design."
+ ]
+}

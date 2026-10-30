@@ -29,7 +29,17 @@ struct QsaAttnPools {
     const uint16_t* v_scale = nullptr;
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
+    const uint8_t* k_tq = nullptr;      ///< TurboQuant block [page][kv_head][page_size][2 + head_dim*bits/8]
+    const uint8_t* v_tq = nullptr;
+    int tq_bits = 0;
     const int32_t* page_table = nullptr;
+};
+
+/// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.
+inline constexpr int kAttnRowsMax = 8;
+struct QsaAttnPoolsRows {
+    QsaAttnPools p[kAttnRowsMax];
+    int n = 0;
 };
 
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
@@ -42,5 +52,35 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+
+/// Up to this many queries of different slots in one qsa_decode_attn_slots call.
+constexpr int kQsaAttnMaxSlots = 8;
+
+/// One KV pool set per query of a qsa_decode_attn_slots call (passed by value as a kernel argument).
+struct QsaAttnSlotPools {
+    QsaAttnPools p[kQsaAttnMaxSlots];
+};
+
+/// qsa_decode_attn_batch for `n_q` queries that each attend over their OWN pools (`pools.p[i]`, one KV cache per batch
+/// slot): one launch instead of one call per query, every block computing exactly what the per-query call computes.
+/// The pools must all have one KV format. False (nothing launched) where the per-query call would run another kernel
+/// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
+bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// For src/kernels/qsa_merge_daily_parity.cpp only: qsa_decode_attn_batch's two passes apart, whatever the environment
+/// says.  `chunks_only` runs the chunk pass into `scratch` with `daily_chunk` 0: attn_chunk_kernel (upstream's default),
+/// 1: the Daily's (attn_chunk_kernel_pre75, what STRATA_ATTN_DAILY=1 picks on CUDA).  `merge_only` merges those
+/// partials with `v2` 0: attn_merge_kernel, 1: attn_merge_v2_kernel (STRATA_ATTN_MERGE_V2, on with STRATA_ATTN_DAILY).
+/// Width must not exceed an unaligned cap (the chunk pass keeps its upstream contract); for aligned caps the grid
+/// bounds widths above cap.  One input can go through every pair and the outputs be compared bit for bit.
+void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, int daily_chunk,
+                                 void* stream);
+void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                float* attn, int64_t n_q, int v2, void* stream);
+/// qsa_decode_attn_batch for up to kAttnRowsMax queries of DIFFERENT sequences (batch slots), query z attending
+/// over rows.p[z] - one launch instead of one per query, the same per-query arithmetic (bit-identical outputs).
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels

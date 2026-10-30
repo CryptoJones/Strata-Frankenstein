@@ -75,9 +75,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
@@ -105,6 +106,8 @@ async function loadHealth() {
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    $("tab-btn-images").hidden = !health.image_generation;
+    if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -166,22 +169,39 @@ function chart(svg, series, max) {
   const W = Math.max(260, Math.round(svg.clientWidth || 720));
   const H = Math.max(90, Math.round(svg.clientHeight || 190));
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  const padL = 46, padR = 10, padT = 8, padB = 18;
+  // a series may name the axis it scales to: "left" (default) or "right", so two
+  // series on different orders of magnitude each keep a readable curve
+  const hasRight = series.some((s) => s.axis === "right");
+  const padL = 46, padR = hasRight ? 46 : 10, padT = 8, padB = 18;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const n = Math.max(0, ...series.map((s) => s.values.length));
-  const flat = series.flatMap((s) => s.values).filter((v) => typeof v === "number");
-  const top = Math.max(max || 0, ...flat, 1e-9) * 1.06;
+  const axisTop = (side) => {
+    const flat = series.filter((s) => (s.axis || "left") === side)
+                       .flatMap((s) => s.values).filter((v) => typeof v === "number");
+    return Math.max(side === "left" ? max || 0 : 0, ...flat, 1e-9) * 1.06;
+  };
+  const topL = axisTop("left"), topR = axisTop("right");
   const px = (i) => padL + (n <= 1 ? plotW : (i / (n - 1)) * plotW);
-  const py = (v) => padT + plotH - (Math.max(0, Math.min(v, top)) / top) * plotH;
+  const pyOn = (top) => (v) => padT + plotH - (Math.max(0, Math.min(v, top)) / top) * plotH;
+  const py = pyOn(topL);
   const base = (padT + plotH).toFixed(1);
   let out = "";
+  const axisColor = (side) => {
+    const s = series.find((x) => (x.axis || "left") === side && x.color);
+    return s ? ` style="fill:${s.color}"` : "";
+  };
   for (let t = 0; t <= 4; t++) {
-    const yy = py((top / 4) * t);
+    const yy = py((topL / 4) * t);
     out += `<line class="grid" x1="${padL}" y1="${yy.toFixed(1)}" x2="${(W - padR).toFixed(1)}" y2="${yy.toFixed(1)}"/>` +
-           `<text class="axis" x="${padL - 7}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${fmt((top / 4) * t, top >= 100 ? 0 : 1)}</text>`;
+           `<text class="axis"${axisColor("left")} x="${padL - 7}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${fmt((topL / 4) * t, topL >= 100 ? 0 : 1)}</text>`;
+    if (hasRight) {
+      const yr = pyOn(topR)((topR / 4) * t);
+      out += `<text class="axis"${axisColor("right")} x="${(W - padR + 7).toFixed(1)}" y="${(yr + 4).toFixed(1)}" text-anchor="start">${fmt((topR / 4) * t, topR >= 100 ? 0 : 1)}</text>`;
+    }
   }
   series.forEach((s, si) => {
-    const pts = s.values.map((v, i) => (typeof v === "number" ? [px(i), py(v)] : null)).filter(Boolean);
+    const pyS = pyOn((s.axis || "left") === "right" ? topR : topL);
+    const pts = s.values.map((v, i) => (typeof v === "number" ? [px(i), pyS(v)] : null)).filter(Boolean);
     if (pts.length < 2) return;
     const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
     if (si === 0) {
@@ -479,8 +499,8 @@ function renderMonitor(m) {
 
   // throughput over the sampler's window
   const samples = (h.tok_s || []).length;
-  chart($("chart-speed"), [{values: h.tok_s || [], color: "var(--st-accent)"},
-                           {values: h.prefill_tok_s_mean || [], color: "var(--st-info)"}]);
+  chart($("chart-speed"), [{values: h.tok_s || [], color: "var(--st-accent)", axis: "left"},
+                           {values: h.prefill_tok_s_mean || [], color: "var(--st-info)", axis: "right"}]);
   $("legend-speed").innerHTML =
     `<span style="color:var(--st-accent)"><i></i>Decode <b>${rate(live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null)}</b></span>` +
     `<span style="color:var(--st-info)"><i></i>Prefill <b>${rate(live.state === "idle" ? null : live.prefill_tok_s_mean)}</b></span>`;
@@ -782,8 +802,18 @@ function markdown(text) {
 }
 
 // ------------------------------------------------------------------ Chat
-const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+// The sampling shown until the user changes it is the model card's thinking set. Untouched, the page sends NO sampling
+// fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
+// 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
+// values untouched counts as "not set" too.
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const OLD_DEFAULT_TEMPERATURE = 0.6;
+function samplingUntouched(s) {
+  const t = +s.temperature;
+  return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
+}
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
@@ -1012,10 +1042,10 @@ async function send() {
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
                 reasoning_effort: settings.thinking};
-  if (settings.temperature > 0) {
-    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
-  } else {
+  if (!(settings.temperature > 0)) {
     body.temperature = 0;
+  } else if (!samplingUntouched(settings)) {
+    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   }
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
@@ -1233,8 +1263,9 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
-  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
+  const d = {reasoning_effort: s.thinking};
+  if (!(+s.temperature > 0)) d.temperature = 0;
+  else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
@@ -1306,3 +1337,36 @@ if (startQuestion) history.replaceState(null, "", location.pathname + location.h
 loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+
+// ------------------------------------------------------------------ images (POST /v1/images/generations)
+$("img-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const prompt = $("img-prompt").value.trim();
+  if (!prompt) return;
+  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
+  if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  $("img-go").disabled = true;
+  const t0 = performance.now();
+  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
+  try {
+    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    for (const d of j.data) {
+      const fig = document.createElement("figure");
+      const img = document.createElement("img");
+      img.src = "data:image/png;base64," + d.b64_json;
+      img.alt = prompt;
+      const cap = document.createElement("figcaption");
+      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      fig.append(img, cap);
+      $("img-results").prepend(fig);
+    }
+    $("img-hint").textContent = "Done. Right-click an image to save it.";
+  } catch (e) {
+    $("img-hint").textContent = "";
+    toast("error", "No image", String(e.message || e), 8000);
+  } finally {
+    $("img-go").disabled = false;
+  }
+};

@@ -1,0 +1,218 @@
+{
+ "hardware": {
+  "gpus": "2x Tesla V100-PCIE-16GB",
+  "power_limit_w": 175,
+  "pcie": "GPU0 Gen3 x4, GPU1 Gen3 x16",
+  "cpu": "Ryzen 5 3600 (6C/12T), 94 GiB RAM",
+  "driver": "580.178.04, CUDA 12.8, engine 0.1.45.3 sm_70"
+ },
+ "configuration": {
+  "model": "Qwen3.8-Flash-Next IQ3_S",
+  "kv": "int8",
+  "context": 524288,
+  "layer_split": 16,
+  "spec": 4,
+  "spec_min_p": 0.7,
+  "pipeline_windows": 2,
+  "prefill_chunk": 8192,
+  "reuse": 0,
+  "profile": "the daily strata-v100.service environment (ROUTE_RESIDENT, PF_WMMA, SELECT_SIMT, SPLIT_MTP_BATCH, PREFILL_PROMOTE, ...), one serve/server.py per arm, same binary"
+ },
+ "primary_comparison": {
+  "method": "three independent 32K prompts per arm and 512 greedy tokens each, bench/run_v100_prefill.py, one fresh engine per arm, same binary",
+  "e2e_decode_tok_s": {
+   "control": [
+    90.1,
+    115.1,
+    91.8
+   ],
+   "ecap20": [
+    110.5,
+    118.1,
+    121.5
+   ],
+   "ecap16": [
+    105.7,
+    127.9,
+    111.9
+   ]
+  },
+  "e2e_prompt_ms": {
+   "control": [
+    14203.7,
+    14035.8,
+    14051.0
+   ],
+   "ecap20": [
+    14231.4,
+    14071.3,
+    14042.6
+   ],
+   "ecap16": [
+    14215.0,
+    14048.3,
+    14024.2
+   ]
+  },
+  "window_report": {
+   "control": [
+    {
+     "windows": 103,
+     "avg_T": 2.74,
+     "tokens_per_window": 2.49,
+     "ms_per_window": 35.5,
+     "tok_s": 70.1
+    }
+   ],
+   "ecap20": [
+    {
+     "windows": 91,
+     "avg_T": 3.0,
+     "tokens_per_window": 2.81,
+     "ms_per_window": 36.06,
+     "tok_s": 77.9
+    }
+   ],
+   "ecap16": [
+    {
+     "windows": 79,
+     "avg_T": 3.66,
+     "tokens_per_window": 3.24,
+     "ms_per_window": 36.88,
+     "tok_s": 87.9
+    }
+   ]
+  },
+  "stage_totals": {
+   "control": [
+    "11.01 ms/window over 114 windows",
+    "26.55 ms/window over 103 windows"
+   ],
+   "ecap20": [
+    "11.71 ms/window over 100 windows",
+    "27.45 ms/window over 91 windows"
+   ],
+   "ecap16": [
+    "12.17 ms/window over 86 windows",
+    "28.79 ms/window over 79 windows"
+   ]
+  },
+  "http_32k_decode_tok_s": {
+   "control": [
+    59.4,
+    75.1,
+    75.7,
+    94.3
+   ],
+   "ecap20": [
+    59.4,
+    75.8,
+    79.1,
+    106.8
+   ],
+   "ecap16": [
+    73.9,
+    71.3,
+    76.0,
+    63.2
+   ]
+  }
+ },
+ "related": {
+  "layer_split_sweep_32k_prompt_ms": {
+   "16": [
+    14161.5
+   ],
+   "20": [
+    18035.1
+   ]
+  },
+  "driver_knobs_32k_prompt_ms": {
+   "control": [
+    14281.1
+   ],
+   "queues4x": [
+    14258.8
+   ],
+   "conn32": [
+    14263.1
+   ]
+  },
+  "baseline_http_rows": [
+   {
+    "label": "~4K",
+    "target": 4156,
+    "prompt_tokens": 4142,
+    "reused": 0,
+    "prompt_ms": 3702.0,
+    "prompt_tok_s": 1118.9,
+    "output_tokens": 64,
+    "decode_ms": 1062.1,
+    "decode_tok_s": 60.3,
+    "hit_rate": 0.963,
+    "duration_s": 4.8,
+    "wall_s": 4.8,
+    "seed": 42,
+    "model": "qwen"
+   },
+   {
+    "label": "~4K",
+    "target": 4390,
+    "prompt_tokens": 4376,
+    "reused": 0,
+    "prompt_ms": 3643.2,
+    "prompt_tok_s": 1201.1,
+    "output_tokens": 64,
+    "decode_ms": 1015.8,
+    "decode_tok_s": 63.0,
+    "hit_rate": 0.969,
+    "duration_s": 4.7,
+    "wall_s": 4.7,
+    "seed": 42,
+    "model": "qwen"
+   },
+   {
+    "label": "~8K",
+    "target": 8801,
+    "prompt_tokens": 8820,
+    "reused": 0,
+    "prompt_ms": 6555.4,
+    "prompt_tok_s": 1345.5,
+    "output_tokens": 64,
+    "decode_ms": 1037.4,
+    "decode_tok_s": 61.7,
+    "hit_rate": 0.96,
+    "duration_s": 7.6,
+    "wall_s": 7.6,
+    "seed": 42,
+    "model": "qwen"
+   },
+   {
+    "label": "32K",
+    "target": 29512,
+    "prompt_tokens": 29527,
+    "reused": 0,
+    "prompt_ms": 13976.0,
+    "prompt_tok_s": 2112.7,
+    "output_tokens": 64,
+    "decode_ms": 940.9,
+    "decode_tok_s": 68.0,
+    "hit_rate": 0.941,
+    "duration_s": 14.9,
+    "wall_s": 14.9,
+    "seed": 42,
+    "model": "qwen"
+   }
+  ]
+ },
+ "validation": {
+  "ecap_parity": "caps 11/16/20/26 x windows 2/3/4/6: cap>=entries a bitwise no-op, token 0 untouched, kept entries unchanged, dropped entries at weight 0 on a kept expert, no expert over T rows, deterministic"
+ },
+ "limits": [
+  "The option changes the output by design: it can accept a draft the exact model would reject.",
+  "No teacher-forced KL, perplexity or quality-equivalence measurement was made.",
+  "The HTTP rows at 256 output tokens are too noisy to separate the effect (one arm spans 59-94 tok/s).",
+  "Prefill does not move: the option is decode-only.",
+  "No HIP execution (this host has no AMD GPU)."
+ ]
+}

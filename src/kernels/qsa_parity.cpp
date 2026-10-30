@@ -1455,6 +1455,60 @@ int main(int argc, char** argv) {
                             same ? "bit-identical" : "*** WRONG ***");
                 if (!same) ++g_bad;
             }
+            // engine-latency: native_qsa_indexer_append_steps_layers - the commit's tail restore + append for several
+            // layers in one launch - against the per-layer copy + append_steps (3 layers, each its own raw rows, tail
+            // snapshot and buffers; cells 2..NB+1 so the first completed block reads the restored tail)
+            {
+                constexpr int NL = 3;
+                Dev<float> pr[NL], dr[NL], tr[NL], pl[NL], dl[NL], tl[NL], src[NL];
+                Dev<int32_t> br[NL], bl[NL];
+                for (int i = 0; i < NL; ++i) {
+                    pr[i].alloc(prows); dr[i].alloc((size_t) IDXD); tr[i].alloc(trows);
+                    pl[i].alloc(prows); dl[i].alloc((size_t) IDXD); tl[i].alloc(trows);
+                    br[i].alloc(1); bl[i].alloc(1);
+                    std::vector<float> ts(trows);
+                    for (auto& x : ts) x = (float) gauss(rng);
+                    src[i].put(ts);
+                }
+                for (int i = 0; i < NL; ++i) {
+                    check(cudaMemset(pr[i].p, 0, prows * 4), "z"); check(cudaMemset(pl[i].p, 0, prows * 4), "z");
+                    check(cudaMemset(dr[i].p, 0, IDXD * 4), "z"); check(cudaMemset(dl[i].p, 0, IDXD * 4), "z");
+                    check(cudaMemset(tr[i].p, 0, trows * 4), "z"); check(cudaMemset(tl[i].p, 0, trows * 4), "z");
+                    check(cudaMemset(br[i].p, 0, 4), "z"); check(cudaMemset(bl[i].p, 0, 4), "z");
+                }
+                std::vector<float> rawL((size_t) NL * NB * IDXD);
+                for (auto& x : rawL) x = (float) gauss(rng);
+                Dev<float> drawL;
+                drawL.put(rawL);
+                Dev<int32_t> dposL((size_t) NB);
+                std::vector<int32_t> hp((size_t) NB);
+                for (int64_t t = 0; t < NB; ++t) hp[(size_t) t] = (int32_t) (2 + t);
+                check(cudaMemcpy(dposL.p, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice), "pos");
+                strata::kernels::QsaIndexerLayers il;
+                for (int i = 0; i < NL; ++i) {   // the reference: copy + append_steps, layer by layer
+                    check(cudaMemcpyAsync(tr[i].p, src[i].p, trows * 4, cudaMemcpyDeviceToDevice, cs), "cp");
+                    strata::kernels::QsaIndexerBuffers b{tr[i].p, dr[i].p, pr[i].p, br[i].p};
+                    strata::kernels::native_qsa_indexer_append_steps(drawL.p + (size_t) i * NB * IDXD, dposL.p, 1, (int) NB, BASE,
+                                                                     dw_kn.p, EPS, b, S, MC, sc, cs);
+                    il.gamma[i] = dw_kn.p; il.tail_src[i] = src[i].p; il.tail[i] = tl[i].p; il.dead[i] = dl[i].p;
+                    il.pooled[i] = pl[i].p; il.block_pos[i] = bl[i].p;
+                }
+                strata::kernels::native_qsa_indexer_append_steps_layers(drawL.p, (int64_t) NB * IDXD, dposL.p, 1, (int) NB, BASE,
+                                                                        EPS, il, NL, S, MC, sc, cs);
+                check(cudaStreamSynchronize(cs), "sync");
+                bool same = true;
+                for (int i = 0; i < NL; ++i) {
+                    const std::vector<float> a1 = pr[i].get(prows), b1 = pl[i].get(prows), a2 = dr[i].get((size_t) IDXD),
+                                             b2 = dl[i].get((size_t) IDXD), a3 = tr[i].get(trows), b3 = tl[i].get(trows);
+                    const std::vector<int32_t> a4 = br[i].get(1), b4 = bl[i].get(1);
+                    same = same && std::memcmp(a1.data(), b1.data(), a1.size() * 4) == 0 &&
+                           std::memcmp(a2.data(), b2.data(), a2.size() * 4) == 0 &&
+                           std::memcmp(a3.data(), b3.data(), a3.size() * 4) == 0 && a4[0] == b4[0];
+                }
+                std::printf("  %-44s %s\n", (std::string("append_steps_layers (3) vs per layer, ") + var.name).c_str(),
+                            same ? "bit-identical" : "*** WRONG ***");
+                if (!same) ++g_bad;
+            }
             check(cudaStreamSynchronize(cs), "sync");
             const std::vector<float> pa = pooledA.get(prows), pb = pooledB.get(prows);
             const std::vector<float> da = deadA.get((size_t) IDXD), db = deadB.get((size_t) IDXD);
@@ -1476,6 +1530,94 @@ int main(int argc, char** argv) {
                 std::printf("  %-44s %d of %zu pooled words differ from the none baseline\n",
                             (std::string("the scaling is visible, ") + var.name).c_str(), moved, pa.size());
                 if (!moved) { std::printf("    *** the batched append ignored its scaling ***\n"); ++g_bad; }
+            }
+        }
+
+        // ---- the window rollback's tail snapshot is the PRE-window one ----
+        // `record_window` snapshots a QSA layer's indexer tail for the commit graph, which restores it and
+        // re-appends only the rows speculation KEPT: the snapshot must hold the tail as it was BEFORE the
+        // window's appends.  The side mixer takes it on its branch before the branch's append; a copy of the
+        // same buffer enqueued on the main stream AFTER that append (a merge dropping the `!sidem` guard left
+        // exactly that) restores a tail still holding the REJECTED row's key, and the rollback re-pools the
+        // block the kept row COMPLETES out of it.  That pooled row is then wrong for every later window whose
+        // selection reads it.  Fixture: a window whose kept row completes a block (cell % r == r - 1) and whose
+        // rejected row is the next cell, so the stale tail slot is one the rollback's pooling reads.  No model.
+        {
+            std::printf("\n-- the window rollback's tail snapshot\n");
+            const int64_t MC2 = 1024;
+            const size_t prows = (size_t) (MC2 / R + 1) * IDXD, trows = (size_t) (R - 1) * IDXD;
+            const int32_t PB = 100;                       // pos_base: the sequence's first cell, r-aligned
+            const int64_t FIRST = R;                      // the window's first cell: 4, so its block is 1
+            const int64_t blk = (FIRST + R - 1) / R;      // the block the kept row completes
+            // cells 4..8: 4, 5, 6 fill the tail, 7 completes block 1, 8 is the REJECTED draft's cell
+            std::vector<float> rb((size_t) 5 * IDXD);
+            for (int64_t t = 0; t < 5; ++t)
+                for (int64_t d = 0; d < IDXD; ++d)
+                    rb[(size_t) t * IDXD + d] = (float) (gauss(rng) * std::pow(4.0, (double) (t % 3)));
+            Dev<float> rw, snapt;
+            rw.put(rb);
+            snapt.alloc(trows);
+            Dev<int32_t> dp5(5);
+            {
+                std::vector<int32_t> hp(5);
+                for (int t = 0; t < 5; ++t) hp[(size_t) t] = (int32_t) (FIRST + t);
+                check(cudaMemcpy(dp5.p, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice), "pos");
+            }
+            strata::kernels::RopeScaling sc2;   // the default: no scaling, the trained angles
+            struct Idx { Dev<float> pooled, dead, tail; Dev<int32_t> bpos; };
+            Idx ref, win, late;
+            for (Idx* x : {&ref, &win, &late}) {
+                x->pooled.alloc(prows); x->dead.alloc((size_t) IDXD); x->tail.alloc(trows); x->bpos.alloc(1);
+                check(cudaMemset(x->pooled.p, 0, prows * 4), "z");
+                check(cudaMemset(x->dead.p, 0, IDXD * 4), "z");
+                check(cudaMemset(x->tail.p, 0, trows * 4), "z");
+                check(cudaMemset(x->bpos.p, 0, 4), "z");
+            }
+            auto bufs = [](Idx& x) { return strata::kernels::QsaIndexerBuffers{x.tail.p, x.dead.p, x.pooled.p, x.bpos.p}; };
+            // (A) the canonical state: the kept prefix alone - cells 4..7
+            strata::kernels::native_qsa_indexer_append_steps(rw.p, dp5.p, 1, (int) R, PB, dw_kn.p, EPS, bufs(ref), S, MC2,
+                                                             sc2, cs);
+            // (B) the window as record_window runs it: cells 4..6, the branch's PRE-append snapshot, cells 7..8,
+            //     the commit's restore and its re-append of the one kept row (7)
+            strata::kernels::native_qsa_indexer_append_steps(rw.p, dp5.p, 1, (int) R - 1, PB, dw_kn.p, EPS, bufs(win), S,
+                                                             MC2, sc2, cs);
+            check(cudaMemcpyAsync(snapt.p, win.tail.p, trows * 4, cudaMemcpyDeviceToDevice, cs), "snap");
+            strata::kernels::native_qsa_indexer_append_steps(rw.p + (size_t) (R - 1) * IDXD, dp5.p + (R - 1), 1, 2, PB,
+                                                             dw_kn.p, EPS, bufs(win), S, MC2, sc2, cs);
+            check(cudaMemcpyAsync(win.tail.p, snapt.p, trows * 4, cudaMemcpyDeviceToDevice, cs), "restore");
+            strata::kernels::native_qsa_indexer_append_steps(rw.p + (size_t) (R - 1) * IDXD, dp5.p + (R - 1), 1, 1, PB,
+                                                             dw_kn.p, EPS, bufs(win), S, MC2, sc2, cs);
+            // (C) the negative control: the same window with the snapshot taken AFTER its appends (cells 4..8)
+            strata::kernels::native_qsa_indexer_append_steps(rw.p, dp5.p, 1, 5, PB, dw_kn.p, EPS, bufs(late), S, MC2, sc2,
+                                                             cs);
+            check(cudaMemcpyAsync(snapt.p, late.tail.p, trows * 4, cudaMemcpyDeviceToDevice, cs), "snap");
+            strata::kernels::native_qsa_indexer_append_steps(rw.p + (size_t) (R - 1) * IDXD, dp5.p + (R - 1), 1, 1, PB,
+                                                             dw_kn.p, EPS, bufs(late), S, MC2, sc2, cs);
+            check(cudaStreamSynchronize(cs), "sync");
+
+            const std::vector<float> rp = ref.pooled.get(prows), rt = ref.tail.get(trows), rd = ref.dead.get((size_t) IDXD);
+            const std::vector<int32_t> rbp = ref.bpos.get(1);
+            const std::vector<float> wp = win.pooled.get(prows), wt = win.tail.get(trows), wd = win.dead.get((size_t) IDXD);
+            const std::vector<int32_t> wbp = win.bpos.get(1);
+            const std::vector<float> lp = late.pooled.get(prows), lt = late.tail.get(trows);
+            auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+                return std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+            };
+            require("the pre-window snapshot restores the tail", same(rt, wt), "bit-identical");
+            require("  ... the dead row and block_pos", same(rd, wd) && rbp[0] == wbp[0], "bit-identical");
+            require("  ... the block the kept row completes", same(rp, wp), "bit-identical pooled rows");
+            const size_t o = (size_t) blk * IDXD;
+            int moved = 0;
+            for (int64_t d = 0; d < IDXD; ++d) moved += std::memcmp(&lp[o + (size_t) d], &rp[o + (size_t) d], 4) != 0;
+            std::printf("  %-44s %d of %lld words\n", "the post-window snapshot's pooled row", moved,
+                        (long long) IDXD);
+            if (moved < IDXD / 2) {
+                std::printf("    *** the fixture cannot see a stale snapshot ***\n");
+                ++g_bad;
+            }
+            if (std::memcmp(lt.data(), rt.data(), (size_t) IDXD * 4) == 0) {
+                std::printf("    *** the stale tail slot was not the rejected row's ***\n");
+                ++g_bad;
             }
         }
         check(cudaStreamDestroy(cs), "csd");

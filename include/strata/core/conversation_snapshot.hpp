@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_prefix.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -13,24 +14,48 @@ namespace strata::core {
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
-// A nonzero unchanged_tokens is valid only for storage retained from an image
-// actually restored into this session, bounded by every subsequent rewrite.
+// A nonzero unchanged_tokens requires restored storage bounded by subsequent
+// rewrites, or an exact prefix comparison against the synchronized session.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+// `unchanged_tokens`: the first token the next save will rewrite.  It adds the
+// bytes a save must copy to detach a dirty tail still shared with another owner
+// (0 for a private buffer), so a retained shared prefix is not charged twice.
+// The draft layer's save rewrites one token earlier - its ring's final cell is
+// refreshed on the next compute - so its caller passes max(unchanged_tokens - 1, 0).
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                                   int64_t upto, bool include_index, size_t& bytes, std::string& error);
+                                   int64_t upto, bool include_index, size_t& bytes, std::string& error,
+                                   int64_t unchanged_tokens = 0);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
+// The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
+// `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
+// and the caller synchronizes the device before it reads or writes either state.
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error, bool queued = false);
+// The first `upto` tokens of an image captured at `captured` tokens: the leading bytes of each buffer (cells come
+// first in the identity layout, as conversation_kv_save takes them), the image untouched.  Cells and indexer rows
+// past `upto` in the restored pages hold the image's later tokens until a request writes them, as after a whole
+// restore followed by a rewind to a checkpoint.
+bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                    int64_t captured, int64_t upto, bool include_index, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+// Revalidate an archived prefix after session rewrites. Compare token cells and
+// completed index rows exactly; exclude padding and the moving spare row.
+// A false match is not an error. The caller synchronizes the device first.
+bool conversation_kv_prefix_matches(const ConversationKv& image, const QsaState& state,
+                                    const ModelGeometry& g, int64_t tokens, bool include_index,
+                                    bool& matches, std::string& error);
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
@@ -74,12 +99,21 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+// conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
+// sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
+// `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
+bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
+                                  const ModelGeometry& g, std::string& error, bool queued = false);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;
     const std::vector<ConversationImageKey>& images;
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;
+    // Capture K/V at an already saved checkpoint, not the session's newer
+    // recurrent state. The caller guarantees that its positional prefix is
+    // still authoritative. Used before active checkpoint eviction.
+    const ConversationCheckpoint* live_state = nullptr;
 };
 
 // ---- The L3 disk tier's delta image for one conversation (one layer-split stage).  The live checkpoint
@@ -121,6 +155,12 @@ enum class ConversationRestore { restored, invalid, transfer_failed };
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);
+// The K/V of the image's first `upto` tokens (main layers and the draft layer), not its running state: the caller
+// mounts a checkpoint taken at `upto`.  For a checkpoint of a parked conversation that a new conversation starts
+// with, while the parked image remains available through ConversationCache::fork. Same failure contract as above.
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& session, const ModelGeometry& g,
+                                                          const QsaState& draft, std::string& error);
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
@@ -138,6 +178,9 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& session, const ModelGeometry& g,
+                                                          const QsaState* draft, std::string& error);
 
 // ---- Stage images (the L3 disk tier).  A layer split parks as one record per conversation: one
 // image per stage, each holding only that stage's carve and its own K/V.  The stage that owns the
